@@ -13,6 +13,7 @@ import { SettingsView } from './components/SettingsView.js';
 import { DiagnosticsView } from './components/DiagnosticsView.js';
 import { LyricsModal } from './components/LyricsModal.js';
 import { AudioPreviewModal } from './components/AudioPreviewModal.js';
+import { AuthModal } from './components/AuthModal.js';
 import { 
   Layers, 
   FolderTree, 
@@ -25,7 +26,8 @@ import {
   AppSettings, 
   SongItem, 
   SyncJob, 
-  EngineLog 
+  EngineLog,
+  AuthUser
 } from './types.js';
 
 export default function App() {
@@ -33,6 +35,53 @@ export default function App() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState<boolean>(false);
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
+
+  // Local Authentication State
+  const [authState, setAuthState] = useState<{
+    loading: boolean;
+    authenticated: boolean;
+    needsSetup: boolean;
+    user: AuthUser | null;
+  }>({
+    loading: true,
+    authenticated: false,
+    needsSetup: false,
+    user: null,
+  });
+
+  const checkAuthStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/auth/status');
+      const data = await res.json();
+      if (data.authenticated && data.user) {
+        setAuthState({
+          loading: false,
+          authenticated: true,
+          needsSetup: false,
+          user: data.user,
+        });
+      } else {
+        setAuthState({
+          loading: false,
+          authenticated: false,
+          needsSetup: Boolean(data.needsSetup),
+          user: null,
+        });
+      }
+    } catch (err) {
+      console.error('Error checking auth status:', err);
+      setAuthState({
+        loading: false,
+        authenticated: false,
+        needsSetup: false,
+        user: null,
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    checkAuthStatus();
+  }, [checkAuthStatus]);
 
   useEffect(() => {
     if (settings && !settings.isConfigured && currentTab !== 'settings') {
@@ -52,6 +101,7 @@ export default function App() {
 
   // Fetch initial data
   const fetchAllData = useCallback(async () => {
+    if (!authState.authenticated) return;
     try {
       const [statusRes, songsRes, queueRes, logsRes, settingsRes] = await Promise.all([
         fetch('/api/status').then(r => r.json()),
@@ -70,9 +120,11 @@ export default function App() {
     } catch (err) {
       console.error('Error fetching initial data:', err);
     }
-  }, []);
+  }, [authState.authenticated]);
 
   useEffect(() => {
+    if (!authState.authenticated) return;
+
     fetchAllData();
 
     // Setup Server-Sent Events (SSE) for real-time live events
@@ -156,7 +208,19 @@ export default function App() {
     return () => {
       eventSource.close();
     };
-  }, [fetchAllData]);
+  }, [authState.authenticated, fetchAllData]);
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch {}
+    setAuthState({
+      loading: false,
+      authenticated: false,
+      needsSetup: false,
+      user: null,
+    });
+  };
 
   // Handlers
   const handleToggleMonitoring = async () => {
@@ -274,6 +338,26 @@ export default function App() {
 
   const activeJobsCount = jobs.filter(j => j.status === 'PROCESSING' || j.status === 'QUEUED' || j.status === 'WAITING_FOR_FILE').length;
 
+  if (authState.loading) {
+    return (
+      <div className="flex h-screen w-screen bg-[#0F172A] text-slate-100 items-center justify-center font-sans">
+        <div className="flex flex-col items-center space-y-4">
+          <div className="w-10 h-10 border-4 border-[#FF4FA3] border-t-transparent rounded-full animate-spin" />
+          <p className="text-xs text-slate-400 font-mono">Verifying local session security...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!authState.authenticated) {
+    return (
+      <AuthModal
+        isSetup={authState.needsSetup}
+        onAuthSuccess={checkAuthStatus}
+      />
+    );
+  }
+
   return (
     <div className="flex h-screen w-screen bg-[#0F172A] text-slate-100 font-sans overflow-hidden select-none">
       {/* Sleek Sidebar (Desktop Persistent + Mobile Drawer) */}
@@ -288,6 +372,8 @@ export default function App() {
         onToggleMonitoring={handleToggleMonitoring}
         isMobileOpen={isMobileMenuOpen}
         onCloseMobile={() => setIsMobileMenuOpen(false)}
+        user={authState.user}
+        onLogout={handleLogout}
       />
 
       {/* Main Content Column */}
@@ -301,6 +387,7 @@ export default function App() {
           onRescan={handleRescan}
           isScanning={isScanning}
           onOpenMobileMenu={() => setIsMobileMenuOpen(true)}
+          userRole={authState.user?.role}
         />
 
         {/* Scrollable View Content */}
@@ -316,6 +403,7 @@ export default function App() {
                 onRemoveJob={handleRemoveJob}
                 onProcessAllIncomplete={handleProcessAllIncomplete}
                 onAddSampleSong={handleAddSampleSong}
+                userRole={authState.user?.role}
               />
             )}
 
@@ -326,6 +414,7 @@ export default function App() {
                 onRefreshLibrary={handleRescan}
                 onPreviewAudio={(filePath, title) => setPreviewAudio({ path: filePath, title })}
                 onEditLyrics={(song) => setSelectedLyricsSong(song)}
+                userRole={authState.user?.role}
               />
             )}
 
@@ -341,6 +430,7 @@ export default function App() {
                 settings={settings}
                 status={status}
                 onSaveSettings={handleSaveSettings}
+                userRole={authState.user?.role}
               />
             )}
 

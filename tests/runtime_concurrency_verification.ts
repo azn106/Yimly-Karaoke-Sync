@@ -133,7 +133,7 @@ async function runMultiSongConcurrencyTest() {
   fs.writeFileSync(song2Path, 'audio 2');
   fs.writeFileSync(song3Path, 'audio 3');
 
-  const qm = new QueueManager();
+  const qm = new QueueManager(path.join(TEST_DIR, 'runtime_queue_state.json'));
 
   // Simulated timings:
   // Song 1: Audio 1000ms, Lyrics 300ms
@@ -262,7 +262,9 @@ async function runMultiSongConcurrencyTest() {
 
   console.log('Queuing Song 1, Song 2, Song 3...\n');
   qm.enqueueSong(song1Path, 'Parallel Pioneer', 'QUEUED', true);
+  await sleep(60);
   qm.enqueueSong(song2Path, 'Concurrent Cruiser', 'QUEUED', true);
+  await sleep(60);
   qm.enqueueSong(song3Path, 'Pipelined Pilot', 'QUEUED', true);
 
   // Wait for all 3 songs to complete

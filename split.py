@@ -51,15 +51,7 @@ def progress(pct, msg=""):
     sys.stderr.flush()
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("request")
-    ap.add_argument("status", nargs="?")
-    args = ap.parse_args()
-
-    with open(args.request, "r", encoding="utf-8") as f:
-        req = json.load(f)
-
+def run_separation(req, status_path=None):
     audio_path  = req["audio"]
     out_dir     = req["out_dir"]
     model       = req.get("model",        "htdemucs")
@@ -72,9 +64,10 @@ def main():
 
     if not os.path.exists(audio_path):
         log("ERR ", f"audio not found: {audio_path}")
-        if args.status:
-            Path(args.status).write_text(json.dumps({"ok": False, "error": "audio not found"}))
-        sys.exit(1)
+        res = {"ok": False, "error": "audio not found"}
+        if status_path:
+            Path(status_path).write_text(json.dumps(res))
+        return res
 
     progress(2, "verifying mandatory CUDA acceleration")
     try:
@@ -84,13 +77,14 @@ def main():
         err_msg = f"missing dependency: {e}"
         log("ERR ", err_msg)
         log("ERR ", "Run setup_whisperx.bat to install PyTorch with CUDA and Demucs.")
-        if args.status:
-            Path(args.status).write_text(json.dumps({
-                "ok": False,
-                "error": f"CUDA/RTX 3060 is required for audio separation but is unavailable: {err_msg}",
-                "device": "none"
-            }))
-        sys.exit(1)
+        res = {
+            "ok": False,
+            "error": f"CUDA/RTX 3060 is required for audio separation but is unavailable: {err_msg}",
+            "device": "none"
+        }
+        if status_path:
+            Path(status_path).write_text(json.dumps(res))
+        return res
 
     # ----------------------------------------------------
     # STRICT MANDATORY CUDA VALIDATION - NO CPU FALLBACK
@@ -126,14 +120,15 @@ def main():
         if cuda_err_detail:
             log("ERR ", f"Diagnostic detail: {cuda_err_detail}")
         log("ERR ", "Demucs CPU fallback is strictly disabled.")
-        if args.status:
-            Path(args.status).write_text(json.dumps({
-                "ok": False,
-                "error": fail_msg,
-                "cuda_error": cuda_err_detail,
-                "device": "cuda",
-            }))
-        sys.exit(1)
+        res = {
+            "ok": False,
+            "error": fail_msg,
+            "cuda_error": cuda_err_detail,
+            "device": "cuda",
+        }
+        if status_path:
+            Path(status_path).write_text(json.dumps(res))
+        return res
 
     device = "cuda"
     log("INFO", f"Audio device: CUDA — {dev_name} ({vram_gb} GB VRAM)")
@@ -167,9 +162,10 @@ def main():
     except Exception as e:
         log("ERR ", f"demucs failed: {e}")
         log("ERR ", traceback.format_exc())
-        if args.status:
-            Path(args.status).write_text(json.dumps({"ok": False, "error": str(e)}))
-        sys.exit(1)
+        res = {"ok": False, "error": str(e)}
+        if status_path:
+            Path(status_path).write_text(json.dumps(res))
+        return res
     elapsed = time.time() - t0
     log("INFO", f"separation done in {elapsed:.1f}s")
 
@@ -184,16 +180,106 @@ def main():
         log("WARN", f"no stems found in {track_dir}")
 
     progress(100, "done")
-    if args.status:
-        Path(args.status).write_text(json.dumps({
-            "ok":       True,
-            "out_dir":  track_dir,
-            "stems":    outputs,
-            "device":   "cuda",
-            "gpu_name": dev_name,
-            "vram_gb":  vram_gb,
-            "elapsed":  elapsed,
-        }))
+    res = {
+        "ok":       True,
+        "out_dir":  track_dir,
+        "stems":    outputs,
+        "device":   "cuda",
+        "gpu_name": dev_name,
+        "vram_gb":  vram_gb,
+        "elapsed":  elapsed,
+    }
+    if status_path:
+        Path(status_path).write_text(json.dumps(res))
+    return res
+
+
+def worker_loop():
+    log("INFO", "Starting Demucs Persistent Worker Process...")
+    try:
+        import torch
+        import demucs.separate
+    except ImportError as e:
+        log("ERR ", f"Demucs worker missing dependency: {e}")
+        sys.exit(1)
+
+    log("INFO", "Demucs Persistent Worker initialized. Awaiting requests...")
+    sys.stdout.write("[WORKER_READY]\n")
+    sys.stdout.flush()
+
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            cmd = json.loads(line)
+        except Exception as e:
+            log("ERR ", f"Worker received invalid JSON command: {e}")
+            res = {"ok": False, "error": f"Invalid JSON command: {e}"}
+            sys.stdout.write(f"[WORKER_RESULT] {json.dumps(res)}\n")
+            sys.stdout.flush()
+            continue
+
+        req_file = cmd.get("request_file")
+        status_file = cmd.get("status_file")
+
+        if req_file and os.path.exists(req_file):
+            try:
+                with open(req_file, "r", encoding="utf-8") as f:
+                    req = json.load(f)
+            except Exception as req_err:
+                log("ERR ", f"Failed to load request file: {req_err}")
+                res = {"ok": False, "error": f"Invalid request file: {req_err}"}
+                if status_file:
+                    Path(status_file).write_text(json.dumps(res))
+                sys.stdout.write(f"[WORKER_RESULT] {json.dumps(res)}\n")
+                sys.stdout.flush()
+                continue
+        else:
+            req = cmd
+
+        try:
+            res = run_separation(req, status_file)
+        except Exception as job_err:
+            log("ERR ", f"Worker error processing job: {job_err}")
+            log("ERR ", traceback.format_exc())
+            res = {"ok": False, "error": str(job_err)}
+            if status_file:
+                try:
+                    Path(status_file).write_text(json.dumps(res))
+                except Exception:
+                    pass
+
+        sys.stdout.write(f"[WORKER_RESULT] {json.dumps(res)}\n")
+        sys.stdout.flush()
+
+        try:
+            if 'torch' in sys.modules and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+        worker_loop()
+        return
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("request")
+    ap.add_argument("status", nargs="?")
+    args = ap.parse_args()
+
+    with open(args.request, "r", encoding="utf-8") as f:
+        req = json.load(f)
+
+    res = run_separation(req, args.status)
+    if not res.get("ok"):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

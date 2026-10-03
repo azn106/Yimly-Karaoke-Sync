@@ -62,6 +62,198 @@ export function formatTimestampMs(ms: number): string {
   return formatTimestamp(ms / 1000);
 }
 
+export interface ParsedLrcLine {
+  timestampSec: number;
+  timestampMs: number;
+  text: string;
+  enhancedWords?: RawLyricWord[];
+}
+
+export interface ParsedLrcResult {
+  metadata: Record<string, string>;
+  offsetMs: number;
+  lines: ParsedLrcLine[];
+  isEnhanced: boolean;
+  rawText: string;
+}
+
+/**
+ * Parses timestamp string (e.g. "01:23.45" or "01:23.456" or "01:23") into milliseconds
+ */
+export function parseTimestampString(timeStr: string): number | null {
+  if (!timeStr || typeof timeStr !== 'string') return null;
+  const match = timeStr.trim().match(/^(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?$/);
+  if (!match) return null;
+  const minutes = parseInt(match[1], 10);
+  const seconds = parseInt(match[2], 10);
+  let fractionMs = 0;
+  if (match[3]) {
+    const fractionStr = match[3].padEnd(3, '0').slice(0, 3);
+    fractionMs = parseInt(fractionStr, 10);
+  }
+  return minutes * 60 * 1000 + seconds * 1000 + fractionMs;
+}
+
+/**
+ * Robust parser for standard and enhanced LRC files:
+ * - [mm:ss.xx] and [mm:ss.xxx] timestamps
+ * - multiple timestamps per line (e.g. [00:01.00][00:15.00]Chorus)
+ * - [offset: +/-ms] tags
+ * - metadata tags ([ti:...], [ar:...], [al:...], [by:...], etc.)
+ * - enhanced word-level tags (<mm:ss.xx>Word)
+ * - Unicode, apostrophes, punctuation, empty lines
+ * - Chronological sorting and duplicate timestamp handling
+ */
+export function parseLrc(lrcContent: string): ParsedLrcResult {
+  if (!lrcContent || typeof lrcContent !== 'string') {
+    return { metadata: {}, offsetMs: 0, lines: [], isEnhanced: false, rawText: '' };
+  }
+
+  const rawLines = lrcContent.split(/\r?\n/);
+  const metadata: Record<string, string> = {};
+  let offsetMs = 0;
+  const parsedLines: ParsedLrcLine[] = [];
+  let isEnhanced = false;
+
+  // First pass: extract metadata tags
+  for (const rawLine of rawLines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+
+    const metaMatch = trimmed.match(/^\[([a-zA-Z]+)\s*:\s*([^\]]*)\]$/);
+    if (metaMatch) {
+      const key = metaMatch[1].toLowerCase();
+      const val = metaMatch[2].trim();
+      metadata[key] = val;
+      if (key === 'offset') {
+        const parsedOffset = parseInt(val, 10);
+        if (!isNaN(parsedOffset)) {
+          offsetMs = parsedOffset;
+        }
+      }
+    }
+  }
+
+  // Second pass: extract timed lines
+  for (const rawLine of rawLines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+
+    // Skip pure metadata lines
+    if (/^\[[a-zA-Z]+\s*:\s*[^\]]*\]$/.test(trimmed)) {
+      continue;
+    }
+
+    // Match all line-level timestamps: [mm:ss.xx]
+    const timestampTagRegex = /\[(\d{1,3}:\d{2}(?:\.\d{1,3})?)\]/g;
+    const timestampMatches: string[] = [];
+    let match: RegExpExecArray | null;
+
+    while ((match = timestampTagRegex.exec(trimmed)) !== null) {
+      timestampMatches.push(match[1]);
+    }
+
+    if (timestampMatches.length === 0) {
+      continue;
+    }
+
+    // Strip line timestamps to get the lyric text
+    const lineContent = trimmed.replace(timestampTagRegex, '').trim();
+
+    // Check for word-level enhanced timing: <mm:ss.xx>Word or <mm:ss.xxx>Word
+    const wordTagRegex = /<(\d{1,3}:\d{2}(?:\.\d{1,3})?)>([^<]*)/g;
+    const words: RawLyricWord[] = [];
+    let wMatch: RegExpExecArray | null;
+
+    while ((wMatch = wordTagRegex.exec(lineContent)) !== null) {
+      const wTsMs = parseTimestampString(wMatch[1]);
+      const wText = wMatch[2];
+      if (wTsMs !== null && wText.trim()) {
+        const adjustedWordMs = Math.max(0, wTsMs + offsetMs);
+        words.push({
+          startMs: adjustedWordMs,
+          durationMs: 0,
+          text: wText.trim(),
+        });
+      }
+    }
+
+    if (words.length > 0) {
+      isEnhanced = true;
+    }
+
+    const cleanLineText = words.length > 0
+      ? words.map(w => w.text).join(' ').trim()
+      : lineContent;
+
+    for (const tsStr of timestampMatches) {
+      const baseMs = parseTimestampString(tsStr);
+      if (baseMs !== null) {
+        const adjustedMs = Math.max(0, baseMs + offsetMs);
+        parsedLines.push({
+          timestampMs: adjustedMs,
+          timestampSec: adjustedMs / 1000,
+          text: cleanLineText,
+          enhancedWords: words.length > 0 ? words : undefined,
+        });
+      }
+    }
+  }
+
+  // Sort chronologically (stable sort)
+  parsedLines.sort((a, b) => a.timestampMs - b.timestampMs);
+
+  return {
+    metadata,
+    offsetMs,
+    lines: parsedLines,
+    isEnhanced,
+    rawText: lrcContent,
+  };
+}
+
+/**
+ * Validates whether an LRC/eLRC content has substantive lyric lines
+ */
+export function isSubstantiveLrc(lrcContent: string): boolean {
+  if (!lrcContent || typeof lrcContent !== 'string') return false;
+  const parsed = parseLrc(lrcContent);
+  if (parsed.lines.length < 3) return false;
+
+  const validLines = parsed.lines.filter(l => {
+    const t = l.text.trim();
+    if (!t) return false;
+    if (/^(作词|作曲|编曲|lyrics by|written by|produced by|title:|artist:|album:|纯音乐|没有填词)/i.test(t)) {
+      return false;
+    }
+    return true;
+  });
+
+  return validLines.length >= 3;
+}
+
+/**
+ * Normalizes an LRC string into cleanly sorted standard LRC [mm:ss.xx] lines
+ */
+export function normalizeLrc(lrcContent: string): string {
+  const parsed = parseLrc(lrcContent);
+  if (parsed.lines.length === 0) return '';
+
+  const output: string[] = [];
+  // Preserve metadata tags if present
+  for (const [k, v] of Object.entries(parsed.metadata)) {
+    if (k !== 'offset') {
+      output.push(`[${k}:${v}]`);
+    }
+  }
+
+  for (const line of parsed.lines) {
+    output.push(`[${formatTimestamp(line.timestampSec)}]${line.text}`);
+  }
+
+  return output.join('\n');
+}
+
 /**
  * Normalizes text for comparison:
  * - handles smart/curly quotes and apostrophes

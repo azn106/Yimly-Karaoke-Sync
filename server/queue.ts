@@ -2,7 +2,10 @@ import { SyncJob, JobStatus, ProcessingPhase, EngineLog, SystemStatus, SubTaskSt
 import { JobExecutor } from './executor.js';
 import { checkSongCompletion } from './scanner.js';
 import path from 'path';
+import fs from 'fs';
 import { EventEmitter } from 'events';
+
+const QUEUE_STATE_FILE = path.join(process.cwd(), 'yimly_queue_state.json');
 
 class AsyncSemaphore {
   private current = 0;
@@ -56,6 +59,8 @@ export class QueueManager extends EventEmitter {
   private activeExecutors = new Map<string, JobExecutor>();
   private logs: EngineLog[] = [];
   private maxLogs = 1000;
+  private persistTimer: NodeJS.Timeout | null = null;
+  public stateFilePath = QUEUE_STATE_FILE;
 
   // Safe concurrency boundaries
   private readonly maxConcurrentSongs = 2;
@@ -63,8 +68,138 @@ export class QueueManager extends EventEmitter {
   private readonly lyricsSemaphore = new AsyncSemaphore(4);  // up to 4 concurrent network queries
   private activeSongCount = 0;
 
-  constructor() {
+  constructor(stateFilePath?: string) {
     super();
+    if (stateFilePath) {
+      this.stateFilePath = stateFilePath;
+    }
+    this.loadPersistedQueue();
+  }
+
+  public loadPersistedQueue() {
+    try {
+      if (fs.existsSync(this.stateFilePath)) {
+        const raw = fs.readFileSync(this.stateFilePath, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          const loadedJobs: SyncJob[] = [];
+          for (const item of parsed) {
+            if (!item || !item.filePath) continue;
+            const absPath = path.resolve(item.filePath);
+            const sourceExists = fs.existsSync(absPath);
+            const completion = checkSongCompletion(absPath);
+
+            let status: JobStatus = item.status || 'QUEUED';
+            let phase: ProcessingPhase = item.currentPhase || 'Detecting';
+            let progress = item.progress || 0;
+            let phaseMessage = item.phaseMessage || '';
+            let error = item.error;
+
+            if (!sourceExists) {
+              status = 'FAILED';
+              phase = 'Failed';
+              error = 'Source audio file no longer exists on disk';
+              phaseMessage = 'Source file missing';
+            } else if (completion.isComplete) {
+              status = 'COMPLETE';
+              phase = 'Complete';
+              progress = 100;
+              phaseMessage = 'Complete ✓ (Verified outputs)';
+              error = undefined;
+            } else if (status === 'PROCESSING') {
+              // Interrupted during previous run: safely re-queue for recovery
+              status = 'QUEUED';
+              phase = 'Detecting';
+              progress = 0;
+              phaseMessage = 'Resumed after server restart';
+              error = undefined;
+            }
+
+            const job: SyncJob = {
+              ...item,
+              id: absPath,
+              filePath: absPath,
+              status,
+              currentPhase: phase,
+              progress,
+              phaseMessage,
+              error,
+              audioTask: status === 'COMPLETE' ? { status: 'COMPLETE', progress: 100 } : undefined,
+              lyricsTask: status === 'COMPLETE' ? { status: 'COMPLETE', progress: 100 } : undefined,
+              liveSegments: [],
+              liveWords: [],
+              logs: item.logs || [],
+              retryCount: item.retryCount || 0,
+            };
+
+            // Deduplicate
+            if (!loadedJobs.some(j => j.id === absPath)) {
+              loadedJobs.push(job);
+            }
+          }
+          this.queue = loadedJobs;
+        }
+      }
+    } catch (e: any) {
+      this.addLog('WARN', `Failed to load persisted queue state: ${e.message}`);
+    }
+  }
+
+  public savePersistedQueue(immediate = false) {
+    const doSave = () => {
+      try {
+        const cleanJobs = this.queue.map(j => ({
+          id: j.id,
+          filePath: j.filePath,
+          fileName: j.fileName,
+          artistName: j.artistName,
+          songTitle: j.songTitle,
+          status: j.status,
+          progress: j.progress,
+          currentPhase: j.currentPhase,
+          phaseMessage: j.phaseMessage,
+          error: j.error,
+          addedAt: j.addedAt,
+          startedAt: j.startedAt,
+          completedAt: j.completedAt,
+          instrumentalStatus: j.instrumentalStatus,
+          elrcStatus: j.elrcStatus,
+          lrcStatus: j.lrcStatus,
+          retryCount: j.retryCount,
+          logs: (j.logs || []).slice(-20),
+        }));
+
+        const tempFile = `${this.stateFilePath}.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        fs.writeFileSync(tempFile, JSON.stringify(cleanJobs, null, 2), 'utf-8');
+        fs.renameSync(tempFile, this.stateFilePath);
+      } catch {}
+    };
+
+    if (immediate) {
+      if (this.persistTimer) {
+        clearTimeout(this.persistTimer);
+        this.persistTimer = null;
+      }
+      doSave();
+    } else {
+      if (!this.persistTimer) {
+        this.persistTimer = setTimeout(() => {
+          this.persistTimer = null;
+          doSave();
+        }, 300);
+      }
+    }
+  }
+
+  public shutdown() {
+    this.isPaused = true;
+    for (const [id, executor] of this.activeExecutors.entries()) {
+      try {
+        executor.abort();
+      } catch {}
+    }
+    this.activeExecutors.clear();
+    this.savePersistedQueue(true);
   }
 
   getJobs(): SyncJob[] {
@@ -221,6 +356,7 @@ export class QueueManager extends EventEmitter {
         this.throttledJobTimers.delete(job.id);
       }
       this.emit('job_updated', job);
+      this.savePersistedQueue(false);
       return;
     }
 
@@ -233,6 +369,7 @@ export class QueueManager extends EventEmitter {
       const current = this.queue.find(x => x.id === job.id);
       if (current) {
         this.emit('job_updated', current);
+        this.savePersistedQueue(false);
       }
     }, 100);
 
@@ -257,6 +394,7 @@ export class QueueManager extends EventEmitter {
 
     this.emitJobUpdated(job, true);
     this.emit('status_changed', this.getSystemSummary());
+    this.savePersistedQueue(true);
 
     if (status === 'QUEUED') {
       this.notifyWorker();
@@ -273,12 +411,14 @@ export class QueueManager extends EventEmitter {
         job.error = undefined;
         job.currentPhase = 'Detecting';
         job.phaseMessage = 'Retrying job';
+        job.retryCount = 0;
         job.audioTask = undefined;
         job.lyricsTask = undefined;
         this.emit('job_updated', job);
         count++;
       }
     }
+    this.savePersistedQueue(true);
     this.emit('status_changed', this.getSystemSummary());
     if (count > 0) {
       this.notifyWorker();
@@ -294,10 +434,12 @@ export class QueueManager extends EventEmitter {
     job.error = undefined;
     job.currentPhase = 'Detecting';
     job.phaseMessage = 'Retrying job';
+    job.retryCount = 0;
     job.audioTask = undefined;
     job.lyricsTask = undefined;
     this.addLog('INFO', `Retrying job: ${job.fileName}`, job.id);
     this.emit('job_updated', job);
+    this.savePersistedQueue(true);
     this.emit('status_changed', this.getSystemSummary());
     this.notifyWorker();
   }
@@ -307,6 +449,7 @@ export class QueueManager extends EventEmitter {
     this.queue = this.queue.filter(j => j.status !== 'COMPLETE' && j.status !== 'SKIPPED');
     const removed = beforeCount - this.queue.length;
     this.addLog('INFO', `Cleared ${removed} completed/skipped jobs from queue.`);
+    this.savePersistedQueue(true);
     this.emit('queue_cleared');
     this.emit('status_changed', this.getSystemSummary());
   }
@@ -322,6 +465,7 @@ export class QueueManager extends EventEmitter {
       }
       this.queue.splice(index, 1);
       this.addLog('INFO', `Removed job: ${job.fileName}`);
+      this.savePersistedQueue(true);
       this.emit('job_removed', jobId);
       this.emit('status_changed', this.getSystemSummary());
       this.notifyWorker();
@@ -430,12 +574,29 @@ export class QueueManager extends EventEmitter {
           onFailed: (jobId, err) => {
             const j = this.queue.find(x => x.id === jobId);
             if (j) {
-              j.status = 'FAILED';
-              j.currentPhase = 'Failed';
-              j.error = err;
-              j.phaseMessage = `Failed: ${err}`;
-              j.completedAt = Date.now();
-              this.emitJobUpdated(j, true);
+              const isTransient = !err.includes('CUDA/RTX 3060 is required') &&
+                                  !err.includes('Original audio file does not exist') &&
+                                  !err.includes('Source file missing');
+              const maxRetries = 2;
+              const currentRetries = j.retryCount || 0;
+
+              if (isTransient && currentRetries < maxRetries) {
+                j.retryCount = currentRetries + 1;
+                j.status = 'QUEUED';
+                j.currentPhase = 'Detecting';
+                j.progress = 0;
+                j.error = undefined;
+                j.phaseMessage = `Retrying after transient error (attempt ${j.retryCount}/${maxRetries}): ${err}`;
+                this.addLog('WARN', `Auto-retrying job "${j.fileName}" (attempt ${j.retryCount}/${maxRetries}): ${err}`, j.id);
+                this.emitJobUpdated(j, true);
+              } else {
+                j.status = 'FAILED';
+                j.currentPhase = 'Failed';
+                j.error = err;
+                j.phaseMessage = `Failed: ${err}`;
+                j.completedAt = Date.now();
+                this.emitJobUpdated(j, true);
+              }
             }
           }
         },

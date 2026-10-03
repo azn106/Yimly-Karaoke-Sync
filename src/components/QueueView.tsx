@@ -36,6 +36,7 @@ interface QueueViewProps {
   onProcessAllIncomplete: () => void;
   onAddSampleSong: () => void;
   onSelectJobLogs?: (jobId: string) => void;
+  userRole?: 'ADMIN' | 'USER';
 }
 
 export const QueueView: React.FC<QueueViewProps> = ({
@@ -48,7 +49,9 @@ export const QueueView: React.FC<QueueViewProps> = ({
   onProcessAllIncomplete,
   onAddSampleSong,
   onSelectJobLogs,
+  userRole,
 }) => {
+  const isAdmin = userRole === 'ADMIN';
   const [filterStatus, setFilterStatus] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
 
@@ -245,8 +248,9 @@ export const QueueView: React.FC<QueueViewProps> = ({
 
           <button
             onClick={onRetryFailed}
-            disabled={failedCount === 0}
+            disabled={failedCount === 0 || !isAdmin}
             className="flex items-center justify-center space-x-2 px-3.5 py-2.5 sm:py-2 rounded-xl bg-slate-800/90 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700 transition disabled:opacity-40 min-h-[40px] sm:min-h-0"
+            title={!isAdmin ? 'Administrator privileges required' : 'Retry failed jobs'}
           >
             <RotateCcw className="w-3.5 h-3.5 text-amber-400" />
             <span>Retry Failed ({failedCount})</span>
@@ -254,8 +258,9 @@ export const QueueView: React.FC<QueueViewProps> = ({
 
           <button
             onClick={onClearCompleted}
-            disabled={completedCount === 0}
+            disabled={completedCount === 0 || !isAdmin}
             className="flex items-center justify-center space-x-2 px-3.5 py-2.5 sm:py-2 rounded-xl bg-slate-800/90 hover:bg-slate-700 text-slate-300 text-xs font-medium border border-slate-700 transition disabled:opacity-40 min-h-[40px] sm:min-h-0 xs:col-span-2 sm:col-span-1"
+            title={!isAdmin ? 'Administrator privileges required' : 'Clear completed jobs from list'}
           >
             <Trash2 className="w-3.5 h-3.5 text-slate-400" />
             <span>Clear Completed ({completedCount})</span>
@@ -272,8 +277,9 @@ export const QueueView: React.FC<QueueViewProps> = ({
 
           <button
             onClick={onAddSampleSong}
-            className="w-full sm:w-auto flex items-center justify-center space-x-2 px-3.5 py-2.5 sm:py-2 rounded-xl bg-[#0F172A] hover:bg-slate-800 text-slate-300 text-xs font-medium border border-slate-800 transition min-h-[40px] sm:min-h-0"
-            title="Simulates copying a new audio file into /media"
+            disabled={!isAdmin}
+            className="w-full sm:w-auto flex items-center justify-center space-x-2 px-3.5 py-2.5 sm:py-2 rounded-xl bg-[#0F172A] hover:bg-slate-800 text-slate-300 text-xs font-medium border border-slate-800 transition min-h-[40px] sm:min-h-0 disabled:opacity-40"
+            title={!isAdmin ? 'Administrator privileges required' : 'Simulates copying a new audio file into /media'}
           >
             <PlusCircle className="w-3.5 h-3.5 text-[#FF4FA3]" />
             <span>Simulate New File</span>

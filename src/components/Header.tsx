@@ -17,6 +17,7 @@ interface HeaderProps {
   onRescan: () => void;
   isScanning: boolean;
   onOpenMobileMenu?: () => void;
+  userRole?: 'ADMIN' | 'USER';
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -27,9 +28,11 @@ export const Header: React.FC<HeaderProps> = ({
   onRescan,
   isScanning,
   onOpenMobileMenu,
+  userRole,
 }) => {
   const isMonitoring = status?.monitoring ?? false;
   const isPaused = status?.queuePaused ?? false;
+  const isAdmin = userRole === 'ADMIN';
 
   return (
     <header className="h-16 border-b border-slate-800 flex items-center justify-between px-3.5 sm:px-6 lg:px-8 bg-[#0F172A] flex-shrink-0 select-none z-10">
@@ -75,9 +78,9 @@ export const Header: React.FC<HeaderProps> = ({
         {/* Quick Rescan */}
         <button
           onClick={onRescan}
-          disabled={isScanning}
-          className="flex items-center space-x-1.5 sm:space-x-2 px-2.5 sm:px-3.5 py-2 rounded-xl bg-[#1E293B] hover:bg-slate-800 text-slate-200 text-xs font-medium border border-slate-800 transition-all disabled:opacity-50 shadow-sm active:scale-95 min-h-[38px]"
-          title="Scan library folder for new or incomplete songs"
+          disabled={isScanning || !isAdmin}
+          className="flex items-center space-x-1.5 sm:space-x-2 px-2.5 sm:px-3.5 py-2 rounded-xl bg-[#1E293B] hover:bg-slate-800 text-slate-200 text-xs font-medium border border-slate-800 transition-all disabled:opacity-40 shadow-sm active:scale-95 min-h-[38px]"
+          title={!isAdmin ? 'Administrator privileges required to rescan media folder' : 'Scan library folder for new or incomplete songs'}
         >
           <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin text-[#FF4FA3]' : 'text-slate-400'}`} />
           <span className="hidden sm:inline">{isScanning ? 'Scanning...' : 'Scan /media'}</span>
@@ -87,12 +90,13 @@ export const Header: React.FC<HeaderProps> = ({
         {/* Queue Pause / Resume */}
         <button
           onClick={onTogglePauseQueue}
-          className={`flex items-center space-x-1.5 sm:space-x-2 px-2.5 sm:px-3.5 py-2 rounded-xl text-xs font-medium border transition-all shadow-sm active:scale-95 min-h-[38px] ${
+          disabled={!isAdmin}
+          className={`flex items-center space-x-1.5 sm:space-x-2 px-2.5 sm:px-3.5 py-2 rounded-xl text-xs font-medium border transition-all shadow-sm active:scale-95 min-h-[38px] disabled:opacity-40 ${
             isPaused
               ? 'bg-amber-500/10 border-amber-500/20 text-amber-300 hover:bg-amber-500/20'
               : 'bg-[#1E293B] hover:bg-slate-800 border-slate-800 text-slate-200'
           }`}
-          title={isPaused ? 'Resume processing queue' : 'Pause processing queue'}
+          title={!isAdmin ? 'Administrator privileges required to pause/resume queue' : (isPaused ? 'Resume processing queue' : 'Pause processing queue')}
         >
           {isPaused ? <Play className="w-3.5 h-3.5 text-amber-400" /> : <Pause className="w-3.5 h-3.5 text-slate-400" />}
           <span className="hidden sm:inline">{isPaused ? 'Resume Queue' : 'Pause Queue'}</span>
@@ -102,11 +106,13 @@ export const Header: React.FC<HeaderProps> = ({
         {/* Monitor Start / Stop */}
         <button
           onClick={onToggleMonitoring}
-          className={`flex items-center space-x-1.5 sm:space-x-2 px-3 sm:px-4 py-2 rounded-xl text-xs font-semibold border transition-all shadow-lg active:scale-95 min-h-[38px] ${
+          disabled={!isAdmin}
+          className={`flex items-center space-x-1.5 sm:space-x-2 px-3 sm:px-4 py-2 rounded-xl text-xs font-semibold border transition-all shadow-lg active:scale-95 min-h-[38px] disabled:opacity-40 ${
             isMonitoring
               ? 'bg-red-500/10 border-red-500/20 text-red-400 hover:bg-red-500/20 shadow-red-500/10'
               : 'bg-[#FF4FA3] hover:bg-[#ff3d99] border-[#FF4FA3] text-white shadow-[#FF4FA3]/25'
           }`}
+          title={!isAdmin ? 'Administrator privileges required to start/stop monitor' : (isMonitoring ? 'Stop background monitor' : 'Start background monitor')}
         >
           {isMonitoring ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
           <span className="hidden sm:inline">{isMonitoring ? 'Stop Monitor' : 'Start Monitor'}</span>

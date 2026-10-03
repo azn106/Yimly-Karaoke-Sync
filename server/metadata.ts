@@ -6,6 +6,41 @@ import { getSettings } from './config.js';
 
 // Cache to prevent re-extracting metadata for unchanged files
 const metadataCache = new Map<string, { mtime: number; size: number; metadata: SongMetadata }>();
+const inFlightProbes = new Map<string, Promise<SongMetadata>>();
+
+// Instrumentation metrics
+let ffprobeInvocationCount = 0;
+let metadataCacheHits = 0;
+let metadataCacheMisses = 0;
+let inFlightDeduplications = 0;
+
+export function getMetadataMetrics() {
+  return {
+    ffprobeInvocationCount,
+    metadataCacheHits,
+    metadataCacheMisses,
+    inFlightDeduplications,
+    cacheSize: metadataCache.size,
+  };
+}
+
+export function resetMetadataMetrics() {
+  ffprobeInvocationCount = 0;
+  metadataCacheHits = 0;
+  metadataCacheMisses = 0;
+  inFlightDeduplications = 0;
+}
+
+export function invalidateMetadataCache(audioPath?: string) {
+  if (audioPath) {
+    const resolved = path.resolve(audioPath);
+    metadataCache.delete(resolved);
+    inFlightProbes.delete(resolved);
+  } else {
+    metadataCache.clear();
+    inFlightProbes.clear();
+  }
+}
 
 // Simple concurrency limiter for ffprobe processes
 let activeFfprobeCount = 0;
@@ -50,143 +85,166 @@ export async function extractMetadata(audioPath: string, stats?: fs.Stats | null
     }
   }
 
+  // 1. Check in-memory metadata cache (path + mtime + size validation)
   const cached = metadataCache.get(resolvedPath);
   if (cached && fileStats && cached.mtime === fileStats.mtimeMs && cached.size === fileStats.size) {
+    metadataCacheHits++;
     return cached.metadata;
   }
 
-  const release = await acquireFfprobeSlot();
+  // 2. Check for an in-flight probe for the exact same file to avoid duplicate processes
+  const existingInFlight = inFlightProbes.get(resolvedPath);
+  if (existingInFlight) {
+    inFlightDeduplications++;
+    return existingInFlight;
+  }
 
-  try {
-    const metadata = await new Promise<SongMetadata>((resolve) => {
-      const ffprobePath = 'ffprobe';
-      const args = [
-        '-v', 'quiet',
-        '-print_format', 'json',
-        '-show_format',
-        '-show_streams',
-        resolvedPath,
-      ];
+  // 3. Cache miss: trigger single ffprobe process
+  metadataCacheMisses++;
 
-      let stdout = '';
-      let settled = false;
-
-      const child = spawn(ffprobePath, args);
-
-      const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          try { child.kill('SIGKILL'); } catch {}
-          resolve(getFallbackMetadata(resolvedPath));
+  const probePromise = (async () => {
+    try {
+      ffprobeInvocationCount++;
+      const release = await acquireFfprobeSlot();
+      try {
+        const metadata = await runFfprobeProcess(resolvedPath);
+        if (fileStats) {
+          metadataCache.set(resolvedPath, {
+            mtime: fileStats.mtimeMs,
+            size: fileStats.size,
+            metadata,
+          });
         }
-      }, 5000);
+        return metadata;
+      } finally {
+        release();
+      }
+    } finally {
+      inFlightProbes.delete(resolvedPath);
+    }
+  })();
 
-      child.stdout.on('data', (d) => { stdout += d.toString(); });
+  inFlightProbes.set(resolvedPath, probePromise);
+  return probePromise;
+}
 
-      child.on('error', () => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          resolve(getFallbackMetadata(resolvedPath));
-        }
-      });
+function runFfprobeProcess(resolvedPath: string): Promise<SongMetadata> {
+  return new Promise<SongMetadata>((resolve) => {
+    const ffprobePath = 'ffprobe';
+    const args = [
+      '-v', 'quiet',
+      '-print_format', 'json',
+      '-show_format',
+      '-show_streams',
+      resolvedPath,
+    ];
 
-      child.on('close', (code) => {
-        if (settled) return;
+    let stdout = '';
+    let settled = false;
+
+    const child = spawn(ffprobePath, args);
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try { child.kill('SIGKILL'); } catch {}
+        resolve(getFallbackMetadata(resolvedPath));
+      }
+    }, 5000);
+
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+
+    child.on('error', () => {
+      if (!settled) {
         settled = true;
         clearTimeout(timer);
-
-        if (code !== 0 || !stdout.trim()) {
-          resolve(getFallbackMetadata(resolvedPath));
-          return;
-        }
-
-        try {
-          const data = JSON.parse(stdout);
-          const tags = data.format?.tags || {};
-
-          // Find if artwork stream exists
-          const videoStreams = data.streams?.filter((s: any) => s.codec_type === 'video' || s.disposition?.attached_pic === 1);
-          const hasArtwork = (videoStreams && videoStreams.length > 0);
-
-          const title = tags.title || tags.TITLE || tags.Title || path.basename(resolvedPath, path.extname(resolvedPath));
-          const artist = tags.artist || tags.ARTIST || tags.Artist || tags.album_artist || tags.ALBUM_ARTIST || '';
-          const album = tags.album || tags.ALBUM || tags.Album || '';
-          const albumArtist = tags.album_artist || tags.ALBUM_ARTIST || tags.albumartist || '';
-          const genre = tags.genre || tags.GENRE || tags.Genre || '';
-          const track = tags.track || tags.TRACK || tags.tracknumber || '';
-          const disc = tags.disc || tags.DISC || tags.discnumber || '';
-          const date = tags.date || tags.DATE || tags.year || tags.YEAR || '';
-          const composer = tags.composer || tags.COMPOSER || '';
-          const copyright = tags.copyright || tags.COPYRIGHT || '';
-
-          // Check for embedded lyrics
-          const embeddedLyrics = tags.lyrics || tags.LYRICS || tags.unsyncedlyrics || tags.UNSYNCEDLYRICS || tags.comment || '';
-
-          // Check companion .lrc or .txt
-          const dir = path.dirname(resolvedPath);
-          const base = path.basename(resolvedPath, path.extname(resolvedPath));
-          const lrcPath = path.join(dir, `${base}.lrc`);
-          const txtPath = path.join(dir, `${base}.txt`);
-
-          let lyricsSource: SongMetadata['lyricsSource'] = 'none';
-          let lyricsPreview: string | undefined = undefined;
-
-          if (embeddedLyrics && embeddedLyrics.trim().length > 10) {
-            lyricsSource = 'embedded';
-            lyricsPreview = embeddedLyrics.trim().slice(0, 120);
-          } else if (fs.existsSync(lrcPath)) {
-            lyricsSource = 'companion_lrc';
-            try {
-              const content = fs.readFileSync(lrcPath, 'utf-8');
-              lyricsPreview = content.slice(0, 120);
-            } catch {}
-          } else if (fs.existsSync(txtPath)) {
-            lyricsSource = 'companion_txt';
-            try {
-              const content = fs.readFileSync(txtPath, 'utf-8');
-              lyricsPreview = content.slice(0, 120);
-            } catch {}
-          }
-
-          const durationSec = data.format?.duration ? parseFloat(data.format.duration) : undefined;
-
-          resolve({
-            title,
-            artist,
-            album,
-            albumArtist,
-            genre,
-            track,
-            disc,
-            date,
-            composer,
-            copyright,
-            duration: durationSec && !isNaN(durationSec) ? durationSec : undefined,
-            hasArtwork,
-            hasEmbeddedLyrics: Boolean(embeddedLyrics && embeddedLyrics.trim().length > 10),
-            embeddedLyrics: embeddedLyrics ? embeddedLyrics.trim() : undefined,
-            lyricsSource,
-            lyricsPreview,
-          });
-        } catch (e) {
-          resolve(getFallbackMetadata(resolvedPath));
-        }
-      });
+        resolve(getFallbackMetadata(resolvedPath));
+      }
     });
 
-    if (fileStats) {
-      metadataCache.set(resolvedPath, {
-        mtime: fileStats.mtimeMs,
-        size: fileStats.size,
-        metadata,
-      });
-    }
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
 
-    return metadata;
-  } finally {
-    release();
-  }
+      if (code !== 0 || !stdout.trim()) {
+        resolve(getFallbackMetadata(resolvedPath));
+        return;
+      }
+
+      try {
+        const data = JSON.parse(stdout);
+        const tags = data.format?.tags || {};
+
+        // Find if artwork stream exists
+        const videoStreams = data.streams?.filter((s: any) => s.codec_type === 'video' || s.disposition?.attached_pic === 1);
+        const hasArtwork = Boolean(videoStreams && videoStreams.length > 0);
+
+        const title = tags.title || tags.TITLE || tags.Title || path.basename(resolvedPath, path.extname(resolvedPath));
+        const artist = tags.artist || tags.ARTIST || tags.Artist || tags.album_artist || tags.ALBUM_ARTIST || '';
+        const album = tags.album || tags.ALBUM || tags.Album || '';
+        const albumArtist = tags.album_artist || tags.ALBUM_ARTIST || tags.albumartist || '';
+        const genre = tags.genre || tags.GENRE || tags.GENRE || tags.Genre || '';
+        const track = tags.track || tags.TRACK || tags.tracknumber || '';
+        const disc = tags.disc || tags.DISC || tags.discnumber || '';
+        const date = tags.date || tags.DATE || tags.year || tags.YEAR || '';
+        const composer = tags.composer || tags.COMPOSER || '';
+        const copyright = tags.copyright || tags.COPYRIGHT || '';
+
+        // Check for embedded lyrics
+        const embeddedLyrics = tags.lyrics || tags.LYRICS || tags.unsyncedlyrics || tags.UNSYNCEDLYRICS || tags.comment || '';
+
+        // Check companion .lrc or .txt
+        const dir = path.dirname(resolvedPath);
+        const base = path.basename(resolvedPath, path.extname(resolvedPath));
+        const lrcPath = path.join(dir, `${base}.lrc`);
+        const txtPath = path.join(dir, `${base}.txt`);
+
+        let lyricsSource: SongMetadata['lyricsSource'] = 'none';
+        let lyricsPreview: string | undefined = undefined;
+
+        if (embeddedLyrics && embeddedLyrics.trim().length > 10) {
+          lyricsSource = 'embedded';
+          lyricsPreview = embeddedLyrics.trim().slice(0, 120);
+        } else if (fs.existsSync(lrcPath)) {
+          lyricsSource = 'companion_lrc';
+          try {
+            const content = fs.readFileSync(lrcPath, 'utf-8');
+            lyricsPreview = content.slice(0, 120);
+          } catch {}
+        } else if (fs.existsSync(txtPath)) {
+          lyricsSource = 'companion_txt';
+          try {
+            const content = fs.readFileSync(txtPath, 'utf-8');
+            lyricsPreview = content.slice(0, 120);
+          } catch {}
+        }
+
+        const durationSec = data.format?.duration ? parseFloat(data.format.duration) : undefined;
+
+        resolve({
+          title,
+          artist,
+          album,
+          albumArtist,
+          genre,
+          track,
+          disc,
+          date,
+          composer,
+          copyright,
+          duration: durationSec && !isNaN(durationSec) ? durationSec : undefined,
+          hasArtwork,
+          hasEmbeddedLyrics: Boolean(embeddedLyrics && embeddedLyrics.trim().length > 10),
+          embeddedLyrics: embeddedLyrics ? embeddedLyrics.trim() : undefined,
+          lyricsSource,
+          lyricsPreview,
+        });
+      } catch (e) {
+        resolve(getFallbackMetadata(resolvedPath));
+      }
+    });
+  });
 }
 
 const SUPPORTED_AUDIO_EXTS = new Set(['.mp3', '.flac', '.m4a', '.wav', '.ogg', '.opus', '.aac']);
@@ -264,7 +322,10 @@ export function findExistingElrc(audioPath: string): string | null {
 
   const elrcPath = path.join(dir, `${basename}.elrc.lrc`);
   if (fs.existsSync(elrcPath)) {
-    return elrcPath;
+    try {
+      const stat = fs.statSync(elrcPath);
+      if (stat.isFile() && stat.size > 0) return elrcPath;
+    } catch {}
   }
   return null;
 }
@@ -279,7 +340,10 @@ export function findExistingLrc(audioPath: string): string | null {
 
   const lrcPath = path.join(dir, `${basename}.lrc`);
   if (fs.existsSync(lrcPath)) {
-    return lrcPath;
+    try {
+      const stat = fs.statSync(lrcPath);
+      if (stat.isFile() && stat.size > 0) return lrcPath;
+    } catch {}
   }
   return null;
 }
@@ -368,6 +432,7 @@ export async function createInstrumentalWithFFmpeg(
   return new Promise((resolve, reject) => {
     const ext = path.extname(originalAudioPath).toLowerCase();
     const instrumentalTitle = metadata.title ? `${metadata.title} (Instrumental)` : `${path.basename(originalAudioPath, ext)} (Instrumental)`;
+    const tempOutputPath = `${outputPath}.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 7)}${ext}`;
 
     onLog(`[INFO] Building instrumental: "${path.basename(outputPath)}" with title "${instrumentalTitle}"`);
 
@@ -421,7 +486,7 @@ export async function createInstrumentalWithFFmpeg(
       '-metadata', 'comment='
     );
 
-    args.push(outputPath);
+    args.push(tempOutputPath);
 
     onLog(`[INFO] Executing FFmpeg command for instrumental encoding...`);
 
@@ -433,18 +498,28 @@ export async function createInstrumentalWithFFmpeg(
     });
 
     child.on('error', (err) => {
+      try { if (fs.existsSync(tempOutputPath)) fs.unlinkSync(tempOutputPath); } catch {}
       reject(new Error(`Failed to launch FFmpeg: ${err.message}`));
     });
 
     child.on('close', (code) => {
-      if (code === 0 && fs.existsSync(outputPath)) {
-        onLog(`[INFO] Instrumental created successfully at ${outputPath}`);
-        resolve();
-      } else {
-        // Fallback simple copy/convert if muxing failed
-        onLog(`[WARN] FFmpeg mux returned code ${code}, trying fallback conversion...`);
-        fallbackSimpleConvert(ffmpegPath, isolatedStemPath, outputPath, instrumentalTitle, metadata, resolve, reject, onLog);
+      if (code === 0 && fs.existsSync(tempOutputPath)) {
+        try {
+          const stats = fs.statSync(tempOutputPath);
+          if (stats.size > 0) {
+            fs.renameSync(tempOutputPath, outputPath);
+            onLog(`[INFO] Instrumental created successfully at ${outputPath}`);
+            resolve();
+            return;
+          }
+        } catch {}
       }
+
+      try { if (fs.existsSync(tempOutputPath)) fs.unlinkSync(tempOutputPath); } catch {}
+
+      // Fallback simple copy/convert if muxing failed
+      onLog(`[WARN] FFmpeg mux returned code ${code}, trying fallback conversion...`);
+      fallbackSimpleConvert(ffmpegPath, isolatedStemPath, outputPath, instrumentalTitle, metadata, resolve, reject, onLog);
     });
   });
 }
@@ -459,22 +534,41 @@ function fallbackSimpleConvert(
   reject: (err: Error) => void,
   onLog: (msg: string) => void
 ) {
+  const ext = path.extname(outputPath).toLowerCase();
+  const tempOutputPath = `${outputPath}.fallback.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 7)}${ext}`;
+
   const args = [
     '-y',
     '-i', stemPath,
     '-metadata', `title=${title}`,
     '-metadata', `artist=${metadata.artist || ''}`,
-    outputPath,
+    tempOutputPath,
   ];
 
   const child = spawn(ffmpegPath, args);
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d.toString(); });
+
   child.on('close', (code) => {
-    if (code === 0 && fs.existsSync(outputPath)) {
-      onLog(`[INFO] Fallback instrumental conversion succeeded.`);
-      resolve();
-    } else {
-      reject(new Error(`FFmpeg instrumental encoding failed with exit code ${code}`));
+    if (code === 0 && fs.existsSync(tempOutputPath)) {
+      try {
+        const stats = fs.statSync(tempOutputPath);
+        if (stats.size > 0) {
+          fs.renameSync(tempOutputPath, outputPath);
+          onLog(`[INFO] Fallback instrumental conversion succeeded.`);
+          resolve();
+          return;
+        }
+      } catch {}
     }
+
+    try { if (fs.existsSync(tempOutputPath)) fs.unlinkSync(tempOutputPath); } catch {}
+    const errDetail = stderr.split('\n').filter(l => l.trim().length > 0).slice(-3).join('; ');
+    reject(new Error(`FFmpeg instrumental encoding failed with exit code ${code}${errDetail ? `: ${errDetail}` : ''}`));
   });
-  child.on('error', (err) => reject(err));
+
+  child.on('error', (err) => {
+    try { if (fs.existsSync(tempOutputPath)) fs.unlinkSync(tempOutputPath); } catch {}
+    reject(err);
+  });
 }

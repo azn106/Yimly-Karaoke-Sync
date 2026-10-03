@@ -11,7 +11,9 @@ import {
   Radio,
   Pause,
   Play,
-  X
+  X,
+  LogOut,
+  User as UserIcon
 } from 'lucide-react';
 import { SystemStatus, AppSettings } from '../types.js';
 
@@ -23,6 +25,8 @@ interface SidebarProps {
   onToggleMonitoring: () => void;
   isMobileOpen?: boolean;
   onCloseMobile?: () => void;
+  user?: { username: string; role: 'ADMIN' | 'USER' } | null;
+  onLogout?: () => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -33,6 +37,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleMonitoring,
   isMobileOpen = false,
   onCloseMobile,
+  user,
+  onLogout,
 }) => {
   const isMonitoring = status?.monitoring ?? false;
   const cudaAvailable = status?.pythonInfo?.cudaAvailable ?? false;
@@ -207,6 +213,30 @@ export const Sidebar: React.FC<SidebarProps> = ({
             )}
           </div>
         </div>
+
+        {/* User Account & Logout Card */}
+        {user && (
+          <div className="p-3 rounded-xl bg-[#0F172A]/90 border border-slate-800 flex items-center justify-between">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-7 h-7 rounded-lg bg-[#FF4FA3]/20 border border-[#FF4FA3]/30 flex items-center justify-center text-[#FF4FA3] text-xs font-bold font-mono shrink-0">
+                {user.username.charAt(0).toUpperCase()}
+              </div>
+              <div className="min-w-0">
+                <div className="text-xs font-bold text-slate-200 truncate">{user.username}</div>
+                <div className="text-[10px] text-[#FF4FA3] font-mono font-semibold uppercase">{user.role}</div>
+              </div>
+            </div>
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-rose-300 hover:bg-rose-500/10 transition shrink-0"
+                title="Sign Out"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

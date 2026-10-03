@@ -1,6 +1,9 @@
 {
-  "mediaRoot": "media",
-  "modelsDir": "models",
+  "mediaRoot": "/app/applet/media",
+  "modelsDir": "/app/applet/models",
+  "pythonPath": "python3",
+  "splitScriptPath": "/app/applet/split.py",
+  "isConfigured": false,
   "useGpu": true,
   "demucs": {
     "model": "htdemucs",
@@ -11,12 +14,14 @@
     "overlap": 0.25,
     "useGpu": true
   },
-  "alignment": {
-    "language": "auto",
-    "useGpu": true,
-    "splitVocals": false
+  "lyrics": {
+    "fetchElrc": true,
+    "fetchLrc": true,
+    "overwriteExisting": false,
+    "elrcLineLeadInMs": 500
   },
   "ffmpegPath": "ffmpeg",
+  "tempDir": "/tmp/yimly_sync_temp",
   "autoStartMonitoring": true,
   "fileStabilityDelayMs": 2000
 }

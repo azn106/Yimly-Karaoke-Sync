@@ -2,7 +2,15 @@ import fs from 'fs';
 import path from 'path';
 import { globalQueue } from './queue.js';
 import { getSettings } from './config.js';
-import { scanMediaDirectory, SUPPORTED_AUDIO_EXTS, checkSongCompletion } from './scanner.js';
+import { 
+  scanMediaDirectory, 
+  SUPPORTED_AUDIO_EXTS, 
+  checkSongCompletion,
+  updateSingleSongInIndex,
+  removeSongFromIndex,
+  handleCompanionFileChangeInIndex,
+  isInstrumentalFilename
+} from './scanner.js';
 
 interface PendingFileCheck {
   filePath: string;
@@ -19,6 +27,10 @@ export class FileMonitor {
   private stabilityInterval: NodeJS.Timeout | null = null;
   private isScanning = false;
   private knownFiles: Set<string> = new Set();
+
+  // Debouncing for batching rapid filesystem events
+  private pendingChangedPaths: Set<string> = new Set();
+  private debounceTimer: NodeJS.Timeout | null = null;
 
   async start() {
     const settings = getSettings();
@@ -44,10 +56,11 @@ export class FileMonitor {
     globalQueue.addLog('INFO', `Running startup scan on ${mediaRoot}...`);
 
     try {
-      const scanResult = await scanMediaDirectory(mediaRoot);
+      const scanResult = await scanMediaDirectory(mediaRoot, true);
       globalQueue.addLog('INFO', `Startup scan finished. Total: ${scanResult.total} songs, Complete: ${scanResult.complete}, Incomplete: ${scanResult.incomplete}`);
 
       // Track all existing files
+      this.knownFiles.clear();
       for (const song of scanResult.songs) {
         this.knownFiles.add(path.resolve(song.filePath));
         if (!song.isComplete) {
@@ -74,6 +87,10 @@ export class FileMonitor {
       clearInterval(this.stabilityInterval);
       this.stabilityInterval = null;
     }
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
     globalQueue.setMonitoring(false);
     globalQueue.addLog('INFO', 'Yimly Sync File Monitor stopped.');
   }
@@ -88,7 +105,7 @@ export class FileMonitor {
     try {
       this.watcher = fs.watch(mediaRoot, { recursive: true }, (eventType, filename) => {
         if (!filename) return;
-        this.handleFileChange(path.join(mediaRoot, filename));
+        this.queueFileChange(path.join(mediaRoot, filename));
       });
     } catch (err) {
       globalQueue.addLog('WARN', `Native recursive watcher error (${err}). Falling back to regular polling.`);
@@ -100,17 +117,62 @@ export class FileMonitor {
     }, 10000);
   }
 
-  private handleFileChange(fullPath: string) {
+  private queueFileChange(fullPath: string) {
+    this.pendingChangedPaths.add(fullPath);
+    if (!this.debounceTimer) {
+      this.debounceTimer = setTimeout(() => {
+        this.processDebouncedFileChanges();
+      }, 150);
+    }
+  }
+
+  private async processDebouncedFileChanges() {
+    const pathsToProcess = Array.from(this.pendingChangedPaths);
+    this.pendingChangedPaths.clear();
+    this.debounceTimer = null;
+
+    const settings = getSettings();
+
+    for (const fullPath of pathsToProcess) {
+      await this.handleFileChange(fullPath, settings.mediaRoot);
+    }
+  }
+
+  private async handleFileChange(fullPath: string, mediaRoot: string) {
+    const baseName = path.basename(fullPath);
+    const lowerBase = baseName.toLowerCase();
+
+    // Ignore temp vocal outputs, hidden files, or node_modules
+    if (lowerBase.startsWith('.') || lowerBase.includes('_vocals.') || lowerBase.includes('htdemucs')) {
+      return;
+    }
+
+    // Check if companion file (.lrc, .elrc.lrc, or instrumental)
+    if (lowerBase.endsWith('.lrc') || isInstrumentalFilename(baseName)) {
+      await handleCompanionFileChangeInIndex(fullPath, mediaRoot);
+      return;
+    }
+
     const ext = path.extname(fullPath).toLowerCase();
     if (!SUPPORTED_AUDIO_EXTS.has(ext)) return;
-    if (fullPath.includes('(Instrumental)')) return;
-    if (fullPath.includes('_vocals.') || fullPath.includes('htdemucs') || path.basename(fullPath).startsWith('.')) return;
-
-    if (!fs.existsSync(fullPath)) return;
 
     const absPath = path.resolve(fullPath);
-    const settings = getSettings();
-    const rel = path.relative(settings.mediaRoot, path.dirname(absPath));
+
+    // If file was deleted from disk
+    if (!fs.existsSync(fullPath)) {
+      removeSongFromIndex(absPath);
+      this.knownFiles.delete(absPath);
+      if (this.pendingFiles.has(absPath)) {
+        this.pendingFiles.delete(absPath);
+      }
+      globalQueue.removeJob(absPath);
+      return;
+    }
+
+    // Update in-memory index incrementally
+    await updateSingleSongInIndex(absPath, mediaRoot);
+
+    const rel = path.relative(mediaRoot, path.dirname(absPath));
     const artistName = rel && rel !== '.' ? rel.split(path.sep)[0] : path.basename(path.dirname(absPath));
 
     // If file is newly discovered and incomplete, put into WAITING FOR FILE check
@@ -142,10 +204,12 @@ export class FileMonitor {
     }, 2000);
   }
 
-  private checkPendingFiles() {
+  private async checkPendingFiles() {
+    const settings = getSettings();
     for (const [filePath, pending] of this.pendingFiles.entries()) {
       if (!fs.existsSync(filePath)) {
         this.pendingFiles.delete(filePath);
+        removeSongFromIndex(filePath);
         globalQueue.removeJob(filePath);
         continue;
       }
@@ -159,7 +223,6 @@ export class FileMonitor {
           
           // If size has stayed constant for 2 successive checks (~4s) and is readable
           if (pending.stableCount >= 2) {
-            // Test if file can be opened for reading
             try {
               const fd = fs.openSync(filePath, 'r');
               fs.closeSync(fd);
@@ -168,7 +231,8 @@ export class FileMonitor {
               this.knownFiles.add(filePath);
               this.pendingFiles.delete(filePath);
 
-              // Enqueue song for processing and wake up worker
+              // Update index and enqueue song for processing
+              await updateSingleSongInIndex(filePath, settings.mediaRoot);
               globalQueue.enqueueSong(filePath, pending.artistName, 'QUEUED');
             } catch (openErr) {
               // Still locked by copying process
@@ -223,7 +287,7 @@ export class FileMonitor {
       for (const filePath of audioFiles) {
         const abs = path.resolve(filePath);
         if (!this.knownFiles.has(abs) && !this.pendingFiles.has(abs)) {
-          this.handleFileChange(abs);
+          this.queueFileChange(abs);
         }
       }
     } catch {}

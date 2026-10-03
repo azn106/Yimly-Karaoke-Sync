@@ -4,9 +4,10 @@ import fs from 'fs';
 import { SyncJob, ProcessingPhase, EngineLog, SubTaskStatus, SubTaskState } from '../src/types.js';
 import { getSettings } from './config.js';
 import { extractMetadata, createInstrumentalWithFFmpeg } from './metadata.js';
-import { findExistingInstrumental, findExistingElrc, findExistingNormalLrc } from './scanner.js';
+import { findExistingInstrumental, findExistingElrc, findExistingNormalLrc, updateSingleSongInIndex } from './scanner.js';
 import { fetchSongDualLyrics, PROVIDER_DISPLAY_NAMES } from './lyrics/manager.js';
 import { verifyCudaGpu, CudaPreflightResult } from './diagnostics.js';
+import { demucsWorkerManager } from './demucs_worker.js';
 
 export interface ExecutionCallbacks {
   onProgress: (jobId: string, phase: ProcessingPhase, progress: number, message: string) => void;
@@ -18,10 +19,37 @@ export interface ExecutionCallbacks {
   onFailed: (jobId: string, error: string) => void;
 }
 
+function atomicWriteFile(targetPath: string, content: string) {
+  const tempPath = `${targetPath}.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  try {
+    fs.writeFileSync(tempPath, content, 'utf-8');
+    fs.renameSync(tempPath, targetPath);
+  } catch (err) {
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+    throw err;
+  }
+}
+
+export function cleanupStaleTempWorkspaces(tempDir: string) {
+  try {
+    if (!fs.existsSync(tempDir)) return;
+    const entries = fs.readdirSync(tempDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && entry.name.startsWith('job_')) {
+        const fullPath = path.join(tempDir, entry.name);
+        try {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        } catch {}
+      }
+    }
+  } catch {}
+}
+
 export class JobExecutor {
   private activeAudioProcess: ChildProcess | null = null;
   private lyricsAbortController: AbortController | null = null;
   private isAborted = false;
+  private activeTempDir: string | null = null;
 
   // Optional mock delegates for unit, regression, and hardware validation tests
   public customCudaValidator?: (pythonPath: string) => Promise<CudaPreflightResult>;
@@ -122,6 +150,7 @@ export class JobExecutor {
 
     // Dedicated temporary working directory
     const jobTempDir = path.join(settings.tempDir, `job_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`);
+    this.activeTempDir = jobTempDir;
 
     try {
       fs.mkdirSync(jobTempDir, { recursive: true });
@@ -264,18 +293,30 @@ export class JobExecutor {
           const splitScriptPath = settings.splitScriptPath || path.join(process.cwd(), 'split.py');
 
           if (fs.existsSync(splitScriptPath)) {
-            const runner = this.customPythonRunner || (this as any).runPythonScript;
-            await runner.call(
-              this,
-              settings.pythonPath || 'python3',
-              [splitScriptPath, splitReqPath, splitStatusPath],
-              settings.modelsDir || '',
-              (prog: number, msg: string) => {
-                const audioPct = Math.round(5 + (prog * 0.80));
-                updateSubTask('audio', { progress: audioPct, message: msg || 'Demucs separating stems...' });
-              },
-              log
-            );
+            if (this.customPythonRunner) {
+              await this.customPythonRunner(
+                settings.pythonPath || 'python3',
+                [splitScriptPath, splitReqPath, splitStatusPath],
+                settings.modelsDir || '',
+                (prog: number, msg: string) => {
+                  const audioPct = Math.round(5 + (prog * 0.80));
+                  updateSubTask('audio', { progress: audioPct, message: msg || 'Demucs separating stems...' });
+                },
+                log
+              );
+            } else {
+              await demucsWorkerManager.runJob(
+                settings.pythonPath || 'python3',
+                splitReqPath,
+                splitStatusPath,
+                settings.modelsDir || '',
+                (prog: number, msg: string) => {
+                  const audioPct = Math.round(5 + (prog * 0.80));
+                  updateSubTask('audio', { progress: audioPct, message: msg || 'Demucs separating stems...' });
+                },
+                log
+              );
+            }
 
             // Read device actually used from split_status.json
             if (fs.existsSync(splitStatusPath)) {
@@ -423,7 +464,7 @@ export class JobExecutor {
           // Handle word-synced .elrc.lrc
           if (!existingElrc) {
             if (dualResult.elrcResult?.elrc) {
-              fs.writeFileSync(expectedElrc, dualResult.elrcResult.elrc, 'utf-8');
+              atomicWriteFile(expectedElrc, dualResult.elrcResult.elrc);
               job.elrcStatus = 'FETCHED';
               const provName = PROVIDER_DISPLAY_NAMES[dualResult.elrcResult.source] || dualResult.elrcResult.source;
               log('INFO', `Saved word-synced eLRC (${dualResult.elrcResult.format} via ${provName}) to "${path.basename(expectedElrc)}" (${dualResult.elrcResult.lineCount} lines).`);
@@ -436,7 +477,7 @@ export class JobExecutor {
           // Handle standard line-synced .lrc
           if (!existingLrc) {
             if (dualResult.lrcResult?.lrc) {
-              fs.writeFileSync(expectedLrc, dualResult.lrcResult.lrc, 'utf-8');
+              atomicWriteFile(expectedLrc, dualResult.lrcResult.lrc);
               job.lrcStatus = 'FETCHED';
               const provName = PROVIDER_DISPLAY_NAMES[dualResult.lrcResult.source] || dualResult.lrcResult.source;
               log('INFO', `Saved standard line-synced LRC (via ${provName}) to "${path.basename(expectedLrc)}" (${dualResult.lrcResult.lineCount} lines).`);
@@ -494,6 +535,11 @@ export class JobExecutor {
       // ----------------------------------------------------
       callbacks.onProgress(job.id, 'Cleaning temporary files', 99, 'Cleaning temporary files...');
       this.cleanupTempDir(jobTempDir, log);
+
+      // Update in-memory library index with verified outputs
+      try {
+        await updateSingleSongInIndex(originalPath, settings.mediaRoot);
+      } catch {}
 
       // Determine final status
       const audioSuccess = Boolean(finalInst) || job.audioTask?.status === 'COMPLETE' || job.instrumentalStatus === 'EXISTS';
@@ -611,6 +657,10 @@ export class JobExecutor {
       }
     } catch (e: any) {
       log('WARN', `Could not clean temp directory ${dir}: ${e.message}`);
+    } finally {
+      if (this.activeTempDir === dir) {
+        this.activeTempDir = null;
+      }
     }
   }
 
@@ -627,6 +677,14 @@ export class JobExecutor {
         this.lyricsAbortController.abort();
       } catch {}
       this.lyricsAbortController = null;
+    }
+    if (this.activeTempDir) {
+      try {
+        if (fs.existsSync(this.activeTempDir)) {
+          fs.rmSync(this.activeTempDir, { recursive: true, force: true });
+        }
+      } catch {}
+      this.activeTempDir = null;
     }
   }
 }

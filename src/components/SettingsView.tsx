@@ -10,9 +10,13 @@ import {
   FileText, 
   Check, 
   Radio,
-  Clock
+  Clock,
+  UserPlus,
+  Users,
+  ShieldCheck,
+  AlertTriangle
 } from 'lucide-react';
-import { AppSettings, SystemStatus } from '../types.js';
+import { AppSettings, SystemStatus, AuthUser } from '../types.js';
 
 function formatLeadInPreview(ms: number): string {
   const safeMs = isNaN(ms) ? 500 : Math.max(0, Math.min(5000, ms));
@@ -27,22 +31,89 @@ interface SettingsViewProps {
   settings: AppSettings | null;
   status: SystemStatus | null;
   onSaveSettings: (newSettings: Partial<AppSettings>) => Promise<void>;
+  userRole?: 'ADMIN' | 'USER';
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   settings,
   status,
   onSaveSettings,
+  userRole,
 }) => {
   const [form, setForm] = useState<AppSettings | null>(settings);
   const [saving, setSaving] = useState<boolean>(false);
   const [savedSuccess, setSavedSuccess] = useState<boolean>(false);
+
+  // User Management State (ADMIN ONLY)
+  const [users, setUsers] = useState<AuthUser[]>([]);
+  const [newUsername, setNewUsername] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [newRole, setNewRole] = useState<'USER' | 'ADMIN'>('USER');
+  const [userError, setUserError] = useState('');
+  const [userSuccess, setUserSuccess] = useState('');
+  const [creatingUser, setCreatingUser] = useState(false);
+
+  const isAdmin = userRole === 'ADMIN';
 
   useEffect(() => {
     if (settings) {
       setForm(settings);
     }
   }, [settings]);
+
+  useEffect(() => {
+    if (isAdmin) {
+      fetch('/api/auth/users')
+        .then(r => r.json())
+        .then(data => {
+          if (data.users) setUsers(data.users);
+        })
+        .catch(() => {});
+    }
+  }, [isAdmin]);
+
+  const handleCreateUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setUserError('');
+    setUserSuccess('');
+
+    if (!newUsername.trim() || !newPassword) {
+      setUserError('Username and password are required.');
+      return;
+    }
+
+    setCreatingUser(true);
+    try {
+      const res = await fetch('/api/auth/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: newUsername.trim(),
+          password: newPassword,
+          role: newRole,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setUserError(data.error || 'Failed to create user');
+        return;
+      }
+
+      setUserSuccess(`User "${data.user.username}" (${data.user.role}) created successfully.`);
+      setNewUsername('');
+      setNewPassword('');
+      setNewRole('USER');
+
+      // Refresh list
+      const uRes = await fetch('/api/auth/users').then(r => r.json());
+      if (uRes.users) setUsers(uRes.users);
+    } catch (err: any) {
+      setUserError(err.message || 'Error creating user');
+    } finally {
+      setCreatingUser(false);
+    }
+  };
 
   if (!form) {
     return <div className="p-8 text-center text-slate-500 text-xs">Loading configuration...</div>;
@@ -64,37 +135,49 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const gpuName = status?.pythonInfo?.deviceName || 'No NVIDIA CUDA GPU detected';
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-6 max-w-4xl">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3.5 sm:gap-4 p-4 sm:p-5 rounded-2xl bg-[#1E293B] border border-slate-800 shadow-sm">
-        <div>
-          <h2 className="text-sm sm:text-base font-bold text-slate-100 flex items-center gap-2.5">
-            <SettingsIcon className="w-5 h-5 text-[#FF4FA3]" />
-            <span>Yimly Sync Engine Settings</span>
-          </h2>
-          <p className="text-[11px] sm:text-xs text-slate-400 mt-1">
-            Configure Demucs instrumental generation, Musixmatch lyrics synchronization, and system parameters.
-          </p>
+    <div className="space-y-6 max-w-4xl">
+      {!isAdmin && (
+        <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs flex items-center gap-3">
+          <AlertTriangle className="w-5 h-5 shrink-0 text-amber-400" />
+          <div>
+            <span className="font-bold block">Read-Only Settings Mode</span>
+            <span className="text-[11px] text-amber-300/80">You are logged in with a USER account. Administrator privileges are required to modify engine settings or manage users.</span>
+          </div>
         </div>
+      )}
 
-        <button
-          type="submit"
-          disabled={saving}
-          className="w-full sm:w-auto flex items-center justify-center space-x-2 px-4 py-2.5 sm:py-2 rounded-xl bg-[#FF4FA3] hover:bg-[#ff3d99] text-white text-xs font-semibold shadow-lg shadow-[#FF4FA3]/25 transition active:scale-95 disabled:opacity-50 min-h-[40px] sm:min-h-0"
-        >
-          {savedSuccess ? (
-            <>
-              <Check className="w-4 h-4 text-emerald-300" />
-              <span>Configuration Saved!</span>
-            </>
-          ) : (
-            <>
-              <Save className="w-4 h-4" />
-              <span>{saving ? 'Saving...' : 'Save Configuration'}</span>
-            </>
-          )}
-        </button>
-      </div>
+      <form onSubmit={handleSubmit} className="space-y-6">
+        {/* Header */}
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3.5 sm:gap-4 p-4 sm:p-5 rounded-2xl bg-[#1E293B] border border-slate-800 shadow-sm">
+          <div>
+            <h2 className="text-sm sm:text-base font-bold text-slate-100 flex items-center gap-2.5">
+              <SettingsIcon className="w-5 h-5 text-[#FF4FA3]" />
+              <span>Yimly Sync Engine Settings</span>
+            </h2>
+            <p className="text-[11px] sm:text-xs text-slate-400 mt-1">
+              Configure Demucs instrumental generation, Musixmatch lyrics synchronization, and system parameters.
+            </p>
+          </div>
+
+          <button
+            type="submit"
+            disabled={saving || !isAdmin}
+            className="w-full sm:w-auto flex items-center justify-center space-x-2 px-4 py-2.5 sm:py-2 rounded-xl bg-[#FF4FA3] hover:bg-[#ff3d99] text-white text-xs font-semibold shadow-lg shadow-[#FF4FA3]/25 transition active:scale-95 disabled:opacity-50 min-h-[40px] sm:min-h-0"
+            title={!isAdmin ? 'Admin privileges required to save configuration' : 'Save configuration'}
+          >
+            {savedSuccess ? (
+              <>
+                <Check className="w-4 h-4 text-emerald-300" />
+                <span>Configuration Saved!</span>
+              </>
+            ) : (
+              <>
+                <Save className="w-4 h-4" />
+                <span>{saving ? 'Saving...' : 'Save Configuration'}</span>
+              </>
+            )}
+          </button>
+        </div>
 
       {/* 1. DIRECTORIES AND PATHS */}
       <div className="p-4 sm:p-6 rounded-2xl bg-[#1E293B] border border-slate-800 space-y-4 shadow-sm">
@@ -422,6 +505,116 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
       </div>
-    </form>
+      </form>
+
+      {/* 6. USER ACCOUNTS & MANAGEMENT (ADMIN ONLY) */}
+      {isAdmin && (
+        <div className="p-6 rounded-2xl bg-[#1E293B] border border-slate-800 space-y-5 shadow-sm">
+          <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+            <div className="flex items-center space-x-3">
+              <Users className="w-4 h-4 text-[#FF4FA3]" />
+              <h3 className="text-sm font-bold text-slate-200">Local User Accounts & Role Management</h3>
+            </div>
+            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-[#FF4FA3]/15 text-[#FF4FA3] border border-[#FF4FA3]/30">
+              ADMINISTRATOR CONTROL
+            </span>
+          </div>
+
+          {/* User Creation Form */}
+          <form onSubmit={handleCreateUser} className="p-4 rounded-xl bg-[#0F172A] border border-slate-800 space-y-4">
+            <h4 className="text-xs font-semibold text-slate-200 flex items-center gap-2">
+              <UserPlus className="w-4 h-4 text-[#FF4FA3]" />
+              <span>Create New Account</span>
+            </h4>
+
+            {userError && (
+              <div className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs">
+                {userError}
+              </div>
+            )}
+
+            {userSuccess && (
+              <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs">
+                {userSuccess}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Username</label>
+                <input
+                  type="text"
+                  value={newUsername}
+                  onChange={e => setNewUsername(e.target.value)}
+                  placeholder="e.g. operator1"
+                  className="w-full px-3 py-2 bg-[#1E293B] border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-[#FF4FA3]"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Password</label>
+                <input
+                  type="password"
+                  value={newPassword}
+                  onChange={e => setNewPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full px-3 py-2 bg-[#1E293B] border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-[#FF4FA3]"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Role</label>
+                <select
+                  value={newRole}
+                  onChange={e => setNewRole(e.target.value as 'USER' | 'ADMIN')}
+                  className="w-full px-3 py-2 bg-[#1E293B] border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-[#FF4FA3]"
+                >
+                  <option value="USER">USER (Standard Access)</option>
+                  <option value="ADMIN">ADMIN (Full Control)</option>
+                </select>
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={creatingUser}
+              className="px-4 py-2 rounded-lg bg-[#FF4FA3] hover:bg-[#ff3d99] text-white text-xs font-semibold transition active:scale-95 disabled:opacity-50"
+            >
+              {creatingUser ? 'Creating...' : 'Create Account'}
+            </button>
+          </form>
+
+          {/* Users List */}
+          <div className="space-y-2">
+            <h4 className="text-xs font-semibold text-slate-300">Existing Accounts ({users.length})</h4>
+            <div className="divide-y divide-slate-800/60 border border-slate-800 rounded-xl overflow-hidden bg-[#0F172A]">
+              {users.map(u => (
+                <div key={u.id} className="p-3 flex items-center justify-between text-xs">
+                  <div className="flex items-center gap-3">
+                    <div className="w-7 h-7 rounded-lg bg-slate-800 flex items-center justify-center font-mono font-bold text-slate-300">
+                      {u.username.charAt(0).toUpperCase()}
+                    </div>
+                    <div>
+                      <div className="font-semibold text-slate-200">{u.username}</div>
+                      <div className="text-[10px] text-slate-500 font-mono">ID: {u.id}</div>
+                    </div>
+                  </div>
+
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
+                    u.role === 'ADMIN'
+                      ? 'bg-[#FF4FA3]/15 text-[#FF4FA3] border-[#FF4FA3]/30'
+                      : 'bg-slate-800 text-slate-300 border-slate-700'
+                  }`}>
+                    {u.role}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 };

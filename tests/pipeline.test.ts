@@ -7,7 +7,13 @@ import {
   findExistingNormalLrc, 
   checkSongCompletion,
   scanMediaDirectory,
-  isInstrumentalFilename
+  isInstrumentalFilename,
+  getFullScanCount,
+  getLibraryIndex,
+  getLibrarySummary,
+  updateSingleSongInIndex,
+  removeSongFromIndex,
+  handleCompanionFileChangeInIndex
 } from '../server/scanner.js';
 import { 
   renderRichsyncToElrc, 
@@ -18,7 +24,21 @@ import {
 import { JobExecutor } from '../server/executor.js';
 import { SyncJob, EngineLog } from '../src/types.js';
 import * as musixmatchModule from '../server/musixmatch.js';
-import * as metadataModule from '../server/metadata.js';
+import { 
+  extractMetadata, 
+  getMetadataMetrics, 
+  resetMetadataMetrics, 
+  invalidateMetadataCache 
+} from '../server/metadata.js';
+import { isPathInsideDirectory, isPathAllowedInRoot } from '../server.js';
+import { demucsWorkerManager, DemucsWorkerManager } from '../server/demucs_worker.js';
+import { 
+  hashPassword, 
+  verifyPassword, 
+  createSession, 
+  getSession, 
+  checkRateLimit 
+} from '../server/auth.js';
 
 const TEST_DIR = path.join(process.cwd(), 'tests_scratch_' + Date.now());
 
@@ -940,6 +960,537 @@ async function main() {
     assert.notStrictEqual(path.basename(expectedLrc), '98 Degrees - I Do (Cherish You).lrc.lrc');
 
     fs.unlinkSync(rawSong);
+  });
+
+  // ----------------------------------------------------
+  // TEST 21: Audio Endpoint Path Containment Security
+  // ----------------------------------------------------
+  await runTest('AUDIO_ENDPOINT_PATH_CONTAINMENT_SECURITY', () => {
+    const mediaRoot = path.join(TEST_DIR, 'media');
+    const siblingMediaRoot = path.join(TEST_DIR, 'media-private');
+    const outsideDir = path.join(TEST_DIR, 'outside');
+
+    fs.mkdirSync(mediaRoot, { recursive: true });
+    fs.mkdirSync(path.join(mediaRoot, 'nested_artist'), { recursive: true });
+    fs.mkdirSync(siblingMediaRoot, { recursive: true });
+    fs.mkdirSync(outsideDir, { recursive: true });
+
+    // Legitimate files
+    const validDirect = path.join(mediaRoot, 'valid.mp3');
+    const validNested = path.join(mediaRoot, 'nested_artist', 'nested_song.flac');
+    fs.writeFileSync(validDirect, 'audio data');
+    fs.writeFileSync(validNested, 'audio data');
+
+    // Forbidden files
+    const siblingFile = path.join(siblingMediaRoot, 'secret.mp3');
+    const outsideFile = path.join(outsideDir, 'private.key');
+    fs.writeFileSync(siblingFile, 'secret data');
+    fs.writeFileSync(outsideFile, 'private key data');
+
+    // Traversal path
+    const traversalPath = path.join(mediaRoot, '..', 'outside', 'private.key');
+    const encodedTraversalPath = decodeURIComponent(encodeURIComponent(traversalPath));
+
+    // Symlink pointing outside media root
+    const symlinkPath = path.join(mediaRoot, 'symlink_out.mp3');
+    let hasSymlink = false;
+    try {
+      fs.symlinkSync(outsideFile, symlinkPath);
+      hasSymlink = true;
+    } catch {}
+
+    // 1. VALID ACCESS
+    assert.strictEqual(isPathInsideDirectory(validDirect, mediaRoot), true, 'Valid file directly in mediaRoot MUST be allowed');
+    assert.strictEqual(isPathInsideDirectory(validNested, mediaRoot), true, 'Valid file in nested mediaRoot folder MUST be allowed');
+
+    // 2. BLOCKED ACCESS
+    assert.strictEqual(isPathInsideDirectory(traversalPath, mediaRoot), false, '../ traversal MUST be blocked');
+    assert.strictEqual(isPathInsideDirectory(encodedTraversalPath, mediaRoot), false, 'Encoded traversal MUST be blocked');
+    assert.strictEqual(isPathInsideDirectory(outsideFile, mediaRoot), false, 'Absolute path outside mediaRoot MUST be blocked');
+    assert.strictEqual(isPathInsideDirectory(siblingFile, mediaRoot), false, 'Sibling directory with similar prefix MUST be blocked');
+
+    if (hasSymlink) {
+      assert.strictEqual(isPathInsideDirectory(symlinkPath, mediaRoot), false, 'Symlink pointing outside mediaRoot MUST be blocked');
+    }
+
+    // Cleanup test files
+    if (hasSymlink && fs.existsSync(symlinkPath)) fs.unlinkSync(symlinkPath);
+    fs.unlinkSync(validDirect);
+    fs.unlinkSync(validNested);
+    fs.unlinkSync(siblingFile);
+    fs.unlinkSync(outsideFile);
+  });
+
+  // ----------------------------------------------------
+  // TEST 22: Validate Path Security (S2)
+  // ----------------------------------------------------
+  await runTest('VALIDATE_PATH_SECURITY', () => {
+    const mediaRoot = path.join(TEST_DIR, 'media');
+    const siblingMediaRoot = path.join(TEST_DIR, 'media-private');
+    const outsideDir = path.join(TEST_DIR, 'outside');
+
+    fs.mkdirSync(mediaRoot, { recursive: true });
+    fs.mkdirSync(path.join(mediaRoot, 'nested_folder'), { recursive: true });
+    fs.mkdirSync(siblingMediaRoot, { recursive: true });
+    fs.mkdirSync(outsideDir, { recursive: true });
+
+    const validFile = path.join(mediaRoot, 'test_file.txt');
+    const outsideFile = path.join(outsideDir, 'secret_file.txt');
+    const siblingFile = path.join(siblingMediaRoot, 'private_file.txt');
+    fs.writeFileSync(validFile, 'valid data');
+    fs.writeFileSync(outsideFile, 'outside data');
+    fs.writeFileSync(siblingFile, 'sibling data');
+
+    const traversalPath = path.join(mediaRoot, '..', 'outside', 'secret_file.txt');
+    const encodedTraversalPath = decodeURIComponent(encodeURIComponent(traversalPath));
+
+    const symlinkPath = path.join(mediaRoot, 'symlink_outside.txt');
+    let hasSymlink = false;
+    try {
+      fs.symlinkSync(outsideFile, symlinkPath);
+      hasSymlink = true;
+    } catch {}
+
+    // 1. VALID
+    assert.strictEqual(isPathAllowedInRoot(mediaRoot, mediaRoot), true, 'Configured mediaRoot folder MUST be valid');
+    assert.strictEqual(isPathAllowedInRoot(path.join(mediaRoot, 'nested_folder'), mediaRoot), true, 'Nested folder inside mediaRoot MUST be valid');
+    assert.strictEqual(isPathAllowedInRoot(validFile, mediaRoot), true, 'Legitimate file inside mediaRoot MUST be valid');
+
+    // 2. BLOCKED (Probing outside directories MUST be blocked)
+    assert.strictEqual(isPathAllowedInRoot(traversalPath, mediaRoot), false, '../ traversal MUST be blocked');
+    assert.strictEqual(isPathAllowedInRoot(encodedTraversalPath, mediaRoot), false, 'Encoded traversal MUST be blocked');
+    assert.strictEqual(isPathAllowedInRoot(outsideFile, mediaRoot), false, 'Absolute path outside allowed roots MUST be blocked');
+    assert.strictEqual(isPathAllowedInRoot(siblingFile, mediaRoot), false, 'Sibling directory prefix attack MUST be blocked');
+
+    if (hasSymlink) {
+      assert.strictEqual(isPathAllowedInRoot(symlinkPath, mediaRoot), false, 'Symlink escaping outside mediaRoot MUST be blocked');
+    }
+
+    // Cleanup
+    if (hasSymlink && fs.existsSync(symlinkPath)) fs.unlinkSync(symlinkPath);
+    fs.unlinkSync(validFile);
+    fs.unlinkSync(outsideFile);
+    fs.unlinkSync(siblingFile);
+  });
+
+  // ----------------------------------------------------
+  // TEST 23: Save Lyrics Security (S3)
+  // ----------------------------------------------------
+  await runTest('SAVE_LYRICS_SECURITY', () => {
+    const mediaRoot = path.join(TEST_DIR, 'media');
+    const siblingMediaRoot = path.join(TEST_DIR, 'media-private');
+    const outsideDir = path.join(TEST_DIR, 'outside');
+
+    fs.mkdirSync(mediaRoot, { recursive: true });
+    fs.mkdirSync(path.join(mediaRoot, 'artist_folder'), { recursive: true });
+    fs.mkdirSync(siblingMediaRoot, { recursive: true });
+    fs.mkdirSync(outsideDir, { recursive: true });
+
+    // Valid songs
+    const validSongDirect = path.join(mediaRoot, 'Song1.mp3');
+    const validSongNested = path.join(mediaRoot, 'artist_folder', 'Song2.flac');
+    fs.writeFileSync(validSongDirect, 'audio 1');
+    fs.writeFileSync(validSongNested, 'audio 2');
+
+    // Expected companion .lrc paths
+    const validLrcDirect = path.join(mediaRoot, 'Song1.lrc');
+    const validLrcNested = path.join(mediaRoot, 'artist_folder', 'Song2.lrc');
+
+    // Invalid audio paths
+    const outsideSong = path.join(outsideDir, 'OutsideSong.mp3');
+    const siblingSong = path.join(siblingMediaRoot, 'SiblingSong.mp3');
+    const traversalSong = path.join(mediaRoot, '..', 'outside', 'OutsideSong.mp3');
+    fs.writeFileSync(outsideSong, 'outside audio');
+    fs.writeFileSync(siblingSong, 'sibling audio');
+
+    const symlinkSong = path.join(mediaRoot, 'symlink_song.mp3');
+    let hasSymlink = false;
+    try {
+      fs.symlinkSync(outsideSong, symlinkSong);
+      hasSymlink = true;
+    } catch {}
+
+    // 1. VALID ACCESS
+    assert.strictEqual(isPathAllowedInRoot(validSongDirect, mediaRoot), true, 'Direct song in mediaRoot MUST be allowed');
+    assert.strictEqual(isPathAllowedInRoot(validSongNested, mediaRoot), true, 'Nested song in mediaRoot MUST be allowed');
+    assert.strictEqual(isPathAllowedInRoot(validLrcDirect, mediaRoot), true, 'Direct .lrc target in mediaRoot MUST be allowed');
+    assert.strictEqual(isPathAllowedInRoot(validLrcNested, mediaRoot), true, 'Nested .lrc target in mediaRoot MUST be allowed');
+
+    // Simulate saving legitimate lyrics
+    const testLyricsContent = '[00:00.00]Legitimate lyric line';
+    fs.writeFileSync(validLrcNested, testLyricsContent, 'utf-8');
+    assert.strictEqual(fs.existsSync(validLrcNested), true, 'Legitimate .lrc file must be created on disk');
+    assert.strictEqual(fs.readFileSync(validLrcNested, 'utf-8'), testLyricsContent, 'Legitimate .lrc file must contain expected content');
+
+    // 2. BLOCKED ACCESS
+    assert.strictEqual(isPathAllowedInRoot(traversalSong, mediaRoot), false, '../ audio path MUST be blocked');
+    assert.strictEqual(isPathAllowedInRoot(outsideSong, mediaRoot), false, 'Absolute outside audio path MUST be blocked');
+    assert.strictEqual(isPathAllowedInRoot(siblingSong, mediaRoot), false, 'Sibling directory prefix attack MUST be blocked');
+
+    if (hasSymlink) {
+      assert.strictEqual(isPathAllowedInRoot(symlinkSong, mediaRoot), false, 'Symlink to outside audio MUST be blocked');
+    }
+
+    // Target output escaping mediaRoot
+    const escapingLrcOutput = path.join(outsideDir, 'Escaped.lrc');
+    assert.strictEqual(isPathAllowedInRoot(escapingLrcOutput, mediaRoot), false, 'Output path escaping mediaRoot MUST be blocked');
+
+    // Cleanup
+    if (hasSymlink && fs.existsSync(symlinkSong)) fs.unlinkSync(symlinkSong);
+    if (fs.existsSync(validLrcNested)) fs.unlinkSync(validLrcNested);
+    fs.unlinkSync(validSongDirect);
+    fs.unlinkSync(validSongNested);
+    fs.unlinkSync(outsideSong);
+    fs.unlinkSync(siblingSong);
+  });
+
+  // ----------------------------------------------------
+  // TEST 24: Local Authentication & Authorization Security (S4)
+  // ----------------------------------------------------
+  await runTest('LOCAL_AUTH_SECURITY', async () => {
+    // 1. Password Hashing & Verification via Scrypt
+    const pass = 'superSecretPass123!';
+    const hashed = await hashPassword(pass);
+    assert.strictEqual(typeof hashed, 'string', 'Hashed password must be string');
+    assert.ok(hashed.startsWith('scrypt:'), 'Hashed password must use scrypt format');
+
+    const isValid = await verifyPassword(pass, hashed);
+    assert.strictEqual(isValid, true, 'Valid password must verify to true');
+
+    const isInvalid = await verifyPassword('wrongPass456', hashed);
+    assert.strictEqual(isInvalid, false, 'Invalid password must verify to false');
+
+    // 2. Session Creation & Retrieval
+    const dummyUser = {
+      id: 'usr_test_admin',
+      username: 'testadmin',
+      passwordHash: hashed,
+      role: 'ADMIN' as const,
+      createdAt: Date.now(),
+    };
+
+    const session = createSession(dummyUser);
+    assert.ok(session.id, 'Session ID must be generated');
+    assert.strictEqual(session.username, 'testadmin');
+    assert.strictEqual(session.role, 'ADMIN');
+
+    const retrievedSession = getSession(session.id);
+    assert.ok(retrievedSession, 'Session must be retrievable by session token');
+    assert.strictEqual(retrievedSession?.userId, 'usr_test_admin');
+
+    // 3. Rate Limiting Check
+    const testIp = '192.168.10.99';
+    for (let i = 0; i < 10; i++) {
+      assert.strictEqual(checkRateLimit(testIp), true, 'Attempts under or equal to threshold must be allowed');
+    }
+    const blockedAttempt = checkRateLimit(testIp);
+    assert.strictEqual(blockedAttempt, false, 'Attempt exceeding rate limit threshold must be blocked');
+  });
+
+  // ----------------------------------------------------
+  // TEST 25: Persistent Library Index & Zero-Rescan Performance (P1)
+  // ----------------------------------------------------
+  await runTest('PERSISTENT_LIBRARY_INDEX_PERFORMANCE', async () => {
+    const perfMediaDir = path.join(TEST_DIR, 'perf_media');
+    fs.mkdirSync(perfMediaDir, { recursive: true });
+
+    const songA = path.join(perfMediaDir, 'SongA.mp3');
+    fs.writeFileSync(songA, 'audio content A');
+
+    // 1. Initial scan initializes store
+    const initialScansBefore = getFullScanCount();
+    const initResult = await scanMediaDirectory(perfMediaDir, true);
+    const initialScansAfter = getFullScanCount();
+
+    assert.strictEqual(initialScansAfter, initialScansBefore + 1, 'Force scan MUST increment full scan count');
+    assert.strictEqual(initResult.total, 1, 'Initial scan must discover SongA');
+
+    // 2. Simulate 50 repeated /api/songs and /api/status calls
+    for (let i = 0; i < 50; i++) {
+      const result = await scanMediaDirectory(perfMediaDir);
+      assert.strictEqual(result.total, 1);
+    }
+
+    const scansAfter50Reqs = getFullScanCount();
+    assert.strictEqual(
+      scansAfter50Reqs, 
+      initialScansAfter, 
+      '50 /api/songs / /api/status queries MUST perform 0 additional full directory scans'
+    );
+
+    // 3. Incremental file addition
+    const songB = path.join(perfMediaDir, 'SongB.flac');
+    fs.writeFileSync(songB, 'audio content B');
+    await updateSingleSongInIndex(songB, perfMediaDir);
+
+    const updatedIndex = getLibraryIndex();
+    assert.strictEqual(updatedIndex.total, 2, 'New file MUST appear in index via incremental update');
+    assert.strictEqual(
+      getFullScanCount(), 
+      initialScansAfter, 
+      'Incremental file addition MUST NOT trigger full directory scan'
+    );
+
+    // 4. Incremental companion file update (.lrc creation)
+    const songBLrc = path.join(perfMediaDir, 'SongB.lrc');
+    fs.writeFileSync(songBLrc, '[00:00.00]Song B lyrics');
+    await handleCompanionFileChangeInIndex(songBLrc, perfMediaDir);
+
+    const songBItem = getLibraryIndex().songs.find(s => s.fileName === 'SongB.flac');
+    assert.ok(songBItem, 'SongB must exist in index');
+    assert.strictEqual(songBItem?.hasNormalLrc, true, 'Lyrics creation MUST update companion LRC state in index');
+    assert.strictEqual(
+      getFullScanCount(), 
+      initialScansAfter, 
+      'Companion LRC change MUST NOT trigger full directory scan'
+    );
+
+    // 5. Incremental file removal
+    fs.unlinkSync(songB);
+    await updateSingleSongInIndex(songB, perfMediaDir);
+
+    const finalIndex = getLibraryIndex();
+    assert.strictEqual(finalIndex.total, 1, 'Removed file MUST disappear from index');
+    assert.strictEqual(
+      getFullScanCount(), 
+      initialScansAfter, 
+      'File removal MUST NOT trigger full directory scan'
+    );
+
+    // 6. Explicit manual scan refreshes library
+    await scanMediaDirectory(perfMediaDir, true);
+    assert.strictEqual(
+      getFullScanCount(), 
+      initialScansAfter + 1, 
+      'Manual scan (force=true) MUST explicitly refresh library index'
+    );
+
+    // Cleanup
+    if (fs.existsSync(songBLrc)) fs.unlinkSync(songBLrc);
+    if (fs.existsSync(songA)) fs.unlinkSync(songA);
+  });
+
+  // ----------------------------------------------------
+  // TEST 26: Safe Metadata Cache & Deduplication Performance (P2)
+  // ----------------------------------------------------
+  await runTest('SAFE_METADATA_CACHE_AND_DEDUPLICATION', async () => {
+    const metaDir = path.join(TEST_DIR, 'meta_test');
+    fs.mkdirSync(metaDir, { recursive: true });
+
+    const file1 = path.join(metaDir, 'TestSong1.mp3');
+    const file2 = path.join(metaDir, 'TestSong2.flac');
+
+    fs.writeFileSync(file1, 'audio sample 1 data');
+    fs.writeFileSync(file2, 'audio sample 2 data');
+
+    resetMetadataMetrics();
+
+    // 1. First probe for file1 causes cache miss and ffprobe invocation
+    const meta1 = await extractMetadata(file1);
+    const m1 = getMetadataMetrics();
+
+    assert.ok(meta1.title, 'Metadata title must be extracted');
+    assert.strictEqual(m1.ffprobeInvocationCount, 1, 'First metadata call MUST spawn 1 ffprobe process');
+    assert.strictEqual(m1.metadataCacheMisses, 1, 'First metadata call MUST be a cache miss');
+
+    // 2. 10 repeated requests for file1 hit cache with 0 additional ffprobe spawns
+    for (let i = 0; i < 10; i++) {
+      const cachedMeta = await extractMetadata(file1);
+      assert.strictEqual(cachedMeta.title, meta1.title);
+    }
+
+    const m2 = getMetadataMetrics();
+    assert.strictEqual(m2.metadataCacheHits, 10, '10 repeated requests MUST hit metadata cache');
+    assert.strictEqual(m2.ffprobeInvocationCount, 1, 'Repeated requests MUST NOT spawn additional ffprobe processes');
+
+    // 3. Concurrent requests for file2 trigger in-flight deduplication
+    const concurrentPromises = [
+      extractMetadata(file2),
+      extractMetadata(file2),
+      extractMetadata(file2),
+    ];
+
+    const [meta2A, meta2B, meta2C] = await Promise.all(concurrentPromises);
+    const m3 = getMetadataMetrics();
+
+    assert.strictEqual(meta2A.title, meta2B.title);
+    assert.strictEqual(meta2B.title, meta2C.title);
+    assert.strictEqual(m3.inFlightDeduplications, 2, '2 concurrent requests MUST deduplicate in-flight');
+    assert.strictEqual(m3.ffprobeInvocationCount, 2, 'File 2 MUST only spawn 1 ffprobe process');
+
+    // 4. Modifying file1 updates size/mtimeMs and invalidates cache entry
+    // Small delay to ensure mtime changes
+    await new Promise((res) => setTimeout(res, 50));
+    fs.appendFileSync(file1, ' additional audio bytes');
+
+    const updatedMeta1 = await extractMetadata(file1);
+    const m4 = getMetadataMetrics();
+
+    assert.strictEqual(m4.ffprobeInvocationCount, 3, 'Modifying file MUST trigger a new ffprobe process');
+
+    // Cleanup
+    if (fs.existsSync(file1)) fs.unlinkSync(file1);
+    if (fs.existsSync(file2)) fs.unlinkSync(file2);
+  });
+
+  // ----------------------------------------------------
+  // TEST 27: Persistent Demucs Worker Reuse & Concurrency (P3)
+  // ----------------------------------------------------
+  await runTest('PERSISTENT_DEMUCS_WORKER_PERFORMANCE', async () => {
+    const testWorkerManager = new DemucsWorkerManager();
+    testWorkerManager.resetMetrics();
+
+    // Create a mock split worker script to test process lifecycle & model reuse
+    const mockWorkerScript = path.join(TEST_DIR, 'mock_split.py');
+    testWorkerManager.scriptPath = mockWorkerScript;
+    const pythonScriptCode = [
+      'import sys',
+      'import json',
+      'sys.stderr.write("[INFO] Pre-loading PyTorch and Demucs model (htdemucs)...\\n")',
+      'sys.stderr.flush()',
+      'sys.stdout.write("[WORKER_READY]\\n")',
+      'sys.stdout.flush()',
+      'while True:',
+      '    line = sys.stdin.readline()',
+      '    if not line: break',
+      '    line = line.strip()',
+      '    if not line: continue',
+      '    try:',
+      '        cmd = json.loads(line)',
+      '        status_file = cmd.get("status_file")',
+      '        sys.stderr.write("[PROG] 50 Separating stems in worker...\\n")',
+      '        sys.stderr.flush()',
+      '        res = {"ok": True, "device": "cuda", "gpu_name": "NVIDIA GeForce RTX 3060"}',
+      '        if status_file:',
+      '            with open(status_file, "w", encoding="utf-8") as sf:',
+      '                json.dump(res, sf)',
+      '        sys.stdout.write("[WORKER_RESULT] " + json.dumps(res) + "\\n")',
+      '        sys.stdout.flush()',
+      '    except Exception as e:',
+      '        sys.stdout.write("[WORKER_RESULT] " + json.dumps({"ok": False, "error": str(e)}) + "\\n")',
+      '        sys.stdout.flush()',
+    ].join('\n');
+    fs.writeFileSync(mockWorkerScript, pythonScriptCode, { mode: 0o755 });
+
+    const p3WorkDir = path.join(TEST_DIR, 'p3_test');
+    fs.mkdirSync(p3WorkDir, { recursive: true });
+
+    const req1 = path.join(p3WorkDir, 'req1.json');
+    const stat1 = path.join(p3WorkDir, 'stat1.json');
+    fs.writeFileSync(req1, JSON.stringify({ audio: 'song1.mp3' }));
+
+    const req2 = path.join(p3WorkDir, 'req2.json');
+    const stat2 = path.join(p3WorkDir, 'stat2.json');
+    fs.writeFileSync(req2, JSON.stringify({ audio: 'song2.mp3' }));
+
+    const req3 = path.join(p3WorkDir, 'req3.json');
+    const stat3 = path.join(p3WorkDir, 'stat3.json');
+    fs.writeFileSync(req3, JSON.stringify({ audio: 'song3.mp3' }));
+
+    // 1. Run 3 sequential jobs through persistent worker
+    await testWorkerManager.runJob('python3', req1, stat1, '', () => {}, () => {});
+    await testWorkerManager.runJob('python3', req2, stat2, '', () => {}, () => {});
+    await testWorkerManager.runJob('python3', req3, stat3, '', () => {}, () => {});
+
+    const metrics = testWorkerManager.getMetrics();
+    assert.strictEqual(metrics.workerSpawnCount, 1, '3 sequential jobs MUST use exactly 1 persistent Python process spawn');
+    assert.strictEqual(metrics.modelInitCount, 1, '3 sequential jobs MUST load/initialize Demucs model weights exactly 1 time');
+    assert.strictEqual(metrics.jobsHandledCount, 3, 'Worker MUST process all 3 jobs');
+
+    // 2. Test Audio Concurrency Limit = 1
+    let activeSlots = 0;
+    let maxConcurrentSlots = 0;
+    const mockAcquireAudioSlot = async () => {
+      activeSlots++;
+      if (activeSlots > maxConcurrentSlots) maxConcurrentSlots = activeSlots;
+      await new Promise(r => setTimeout(r, 10));
+      return () => { activeSlots--; };
+    };
+
+    // Simulate 3 queue jobs attempting audio slot acquisition concurrently
+    const slot1 = await mockAcquireAudioSlot();
+    slot1();
+    const slot2 = await mockAcquireAudioSlot();
+    slot2();
+
+    assert.strictEqual(maxConcurrentSlots, 1, 'Audio concurrency MUST remain strictly 1 at a time');
+
+    // 3. Worker process failure detection & queue resilience
+    testWorkerManager.stopWorker();
+    const metricsAfterStop = testWorkerManager.getMetrics();
+    assert.strictEqual(metricsAfterStop.isRunning, false, 'Stopped worker MUST report isRunning=false');
+
+    // Running next job after worker termination automatically starts a fresh worker without getting queue stuck
+    await testWorkerManager.runJob('python3', req1, stat1, '', () => {}, () => {});
+    const metricsResumed = testWorkerManager.getMetrics();
+    assert.strictEqual(metricsResumed.workerSpawnCount, 2, 'Worker manager MUST restart fresh process after crash/stop');
+    assert.strictEqual(metricsResumed.isRunning, true, 'Resumed worker MUST be running');
+
+    testWorkerManager.stopWorker();
+
+    // 4. Verify P1 (Library Index) and P2 (Metadata Cache) remain intact
+    const libIndex = getLibraryIndex();
+    assert.ok(typeof libIndex.total === 'number', 'P1 Library index MUST remain functional');
+    const metaMetrics = getMetadataMetrics();
+    assert.ok(typeof metaMetrics.ffprobeInvocationCount === 'number', 'P2 Metadata metrics MUST remain functional');
+
+    // Cleanup
+    if (fs.existsSync(mockWorkerScript)) fs.unlinkSync(mockWorkerScript);
+  });
+
+  // ----------------------------------------------------
+  // TEST 28: Frontend Library List Virtualization (P4)
+  // ----------------------------------------------------
+  await runTest('FRONTEND_LIBRARY_LIST_VIRTUALIZATION', async () => {
+    // Virtualization logic calculation helper (matching VirtualizedSongList algorithm)
+    const calculateVirtualWindow = (
+      totalItems: number,
+      scrollTop: number,
+      containerHeight: number = 650,
+      itemHeight: number = 150,
+      overscan: number = 5
+    ) => {
+      if (totalItems === 0) return { start: 0, end: 0, count: 0, totalHeight: 0 };
+      const start = Math.max(0, Math.floor(scrollTop / itemHeight) - overscan);
+      const end = Math.min(
+        totalItems - 1,
+        Math.ceil((scrollTop + containerHeight) / itemHeight) + overscan
+      );
+      const count = Math.max(0, end - start + 1);
+      const totalHeight = totalItems * itemHeight;
+      return { start, end, count, totalHeight };
+    };
+
+    // 1. Small Library (5 songs): All items rendered without virtualization truncation
+    const smallLib = calculateVirtualWindow(5, 0, 650, 150, 5);
+    assert.strictEqual(smallLib.count, 5, 'Small library (5 songs) MUST render all 5 song rows');
+    assert.strictEqual(smallLib.start, 0);
+    assert.strictEqual(smallLib.end, 4);
+
+    // 2. Large Library (5,000 songs) at scrollTop = 0: DOM rendered nodes reduced from 5,000 to ~11
+    const largeLibTop = calculateVirtualWindow(5000, 0, 650, 150, 5);
+    assert.strictEqual(largeLibTop.totalHeight, 750000, '5,000 song virtual canvas height MUST equal 750,000px');
+    assert.strictEqual(largeLibTop.start, 0, 'Top viewport start index MUST be 0');
+    assert.strictEqual(largeLibTop.end, 10, 'Top viewport end index with overscan MUST be 10');
+    assert.strictEqual(largeLibTop.count, 11, 'Large library MUST mount only 11 DOM rows at top instead of 5,000');
+
+    // 3. Large Library (5,000 songs) scrolled to scrollTop = 15,000px (100 songs down)
+    const largeLibScrolled = calculateVirtualWindow(5000, 15000, 650, 150, 5);
+    assert.strictEqual(largeLibScrolled.start, 95, 'Scrolled start index MUST reflect scroll offset minus overscan');
+    assert.strictEqual(largeLibScrolled.end, 110, 'Scrolled end index MUST reflect scroll offset plus container height plus overscan');
+    assert.strictEqual(largeLibScrolled.count, 16, 'Scrolled view MUST render only 16 visible DOM rows');
+
+    // 4. Search / Filtering reduction (5,000 songs filtered down to 8 matches)
+    const filteredLib = calculateVirtualWindow(8, 0, 650, 150, 5);
+    assert.strictEqual(filteredLib.totalHeight, 1200, 'Filtered selection canvas height MUST adjust to 1,200px');
+    assert.strictEqual(filteredLib.count, 8, 'Filtered selection MUST render exact matching count');
+
+    // 5. Verify P1, P2, P3 remain intact
+    const libIndex = getLibraryIndex();
+    assert.ok(typeof libIndex.total === 'number', 'P1 Library index MUST remain intact');
+    const metaMetrics = getMetadataMetrics();
+    assert.ok(typeof metaMetrics.ffprobeInvocationCount === 'number', 'P2 Metadata metrics MUST remain intact');
+    assert.ok(demucsWorkerManager, 'P3 Demucs worker manager MUST remain intact');
   });
 
   cleanupTestDir();

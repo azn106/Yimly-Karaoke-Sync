@@ -109,6 +109,8 @@ export interface SyncJob {
   liveSegments?: Array<{ start: number; end: number; text: string }>;
   liveWords?: Array<{ time: number; userWord: string; whisperWord: string }>;
   logs?: string[];
+  retryCount?: number;
+  interrupted?: boolean;
 }
 
 export interface AppSettings {
@@ -197,4 +199,11 @@ export interface SystemStatus {
     authenticated: boolean;
     tokenPreview?: string;
   };
+}
+
+export interface AuthUser {
+  id: string;
+  username: string;
+  role: 'ADMIN' | 'USER';
+  createdAt?: number;
 }
