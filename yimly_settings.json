@@ -1,0 +1,22 @@
+{
+  "mediaRoot": "media",
+  "modelsDir": "models",
+  "useGpu": true,
+  "demucs": {
+    "model": "htdemucs",
+    "stems": "vocals",
+    "format": "flac",
+    "mp3Bitrate": 320,
+    "shifts": 1,
+    "overlap": 0.25,
+    "useGpu": true
+  },
+  "alignment": {
+    "language": "auto",
+    "useGpu": true,
+    "splitVocals": false
+  },
+  "ffmpegPath": "ffmpeg",
+  "autoStartMonitoring": true,
+  "fileStabilityDelayMs": 2000
+}

@@ -1,0 +1,8 @@
+{
+  "name": "Yimly Sync LDDC",
+  "description": "Desktop monitoring frontend and orchestrator for Yimly music library with Demucs stem separation and WhisperX lyric alignment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
