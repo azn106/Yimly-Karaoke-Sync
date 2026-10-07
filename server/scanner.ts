@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { SongItem } from '../src/types.js';
-import { extractMetadata } from './metadata.js';
+import { extractMetadata, invalidateMetadataCache } from './metadata.js';
 
 export const SUPPORTED_AUDIO_EXTS = new Set(['.mp3', '.flac', '.m4a', '.wav', '.ogg', '.opus']);
 
@@ -14,7 +14,11 @@ export function isInstrumentalFilename(fileName: string): boolean {
     lower.includes(' instrumental.') ||
     lower.includes('_instrumental.') ||
     lower.includes('(instrumental version)') ||
-    lower.includes('[instrumental version]')
+    lower.includes('[instrumental version]') ||
+    lower.includes('(inst)') ||
+    lower.includes('[inst]') ||
+    lower.includes(' - inst.') ||
+    lower.includes('_inst.')
   );
 }
 
@@ -246,6 +250,7 @@ export async function updateSingleSongInIndex(audioPath: string, mediaRoot: stri
 
 export function removeSongFromIndex(audioPath: string): void {
   const resolved = path.resolve(audioPath);
+  invalidateMetadataCache(resolved);
   if (libraryStore.songsMap.has(resolved)) {
     libraryStore.songsMap.delete(resolved);
     rebuildStoreSummary();
@@ -268,7 +273,10 @@ export async function handleCompanionFileChangeInIndex(filePath: string, mediaRo
     prefix = baseName
       .replace(/\s*[\(\[]instrumental(\s+version)?[\)\]]/gi, '')
       .replace(/\s+-\s+instrumental/gi, '')
-      .replace(/_instrumental/gi, '');
+      .replace(/_instrumental/gi, '')
+      .replace(/\s*[\(\[]inst[\)\]]/gi, '')
+      .replace(/\s+-\s+inst/gi, '')
+      .replace(/_inst/gi, '');
     const ext = path.extname(prefix);
     if (ext && SUPPORTED_AUDIO_EXTS.has(ext.toLowerCase())) {
       prefix = path.basename(prefix, ext);
@@ -281,6 +289,7 @@ export async function handleCompanionFileChangeInIndex(filePath: string, mediaRo
     const candidate = path.join(dir, `${prefix}${ext}`);
     const resolvedCandidate = path.resolve(candidate);
     if (fs.existsSync(candidate) || libraryStore.songsMap.has(resolvedCandidate)) {
+      invalidateMetadataCache(resolvedCandidate);
       await updateSingleSongInIndex(candidate, resolvedRoot);
     }
   }

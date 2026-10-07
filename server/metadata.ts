@@ -42,6 +42,28 @@ export function invalidateMetadataCache(audioPath?: string) {
   }
 }
 
+export function setCachedMetadata(
+  audioPath: string,
+  metadata: SongMetadata,
+  stats?: { mtimeMs?: number; size?: number }
+) {
+  const resolved = path.resolve(audioPath);
+  let mtime = stats?.mtimeMs ?? 0;
+  let size = stats?.size ?? 0;
+  if ((!mtime || !size) && fs.existsSync(resolved)) {
+    try {
+      const st = fs.statSync(resolved);
+      mtime = st.mtimeMs;
+      size = st.size;
+    } catch {}
+  }
+  metadataCache.set(resolved, {
+    mtime,
+    size,
+    metadata,
+  });
+}
+
 // Simple concurrency limiter for ffprobe processes
 let activeFfprobeCount = 0;
 const MAX_CONCURRENT_FFPROBE = 4;

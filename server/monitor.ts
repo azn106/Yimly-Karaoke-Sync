@@ -284,10 +284,20 @@ export class FileMonitor {
 
       walk(settings.mediaRoot);
 
+      // Reconcile newly appeared files
       for (const filePath of audioFiles) {
         const abs = path.resolve(filePath);
         if (!this.knownFiles.has(abs) && !this.pendingFiles.has(abs)) {
           this.queueFileChange(abs);
+        }
+      }
+
+      // Reconcile deleted files
+      for (const known of Array.from(this.knownFiles)) {
+        if (!fs.existsSync(known)) {
+          this.knownFiles.delete(known);
+          removeSongFromIndex(known);
+          globalQueue.removeJob(known);
         }
       }
     } catch {}
